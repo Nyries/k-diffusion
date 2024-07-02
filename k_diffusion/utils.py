@@ -416,8 +416,10 @@ class CSVLogger:
         self.filename = Path(filename)
         self.columns = columns
         if self.filename.exists():
+            print('exist')
             self.file = open(self.filename, 'a')
         else:
+            print("doesn't exist")
             self.file = open(self.filename, 'w')
             self.write(*self.columns)
 

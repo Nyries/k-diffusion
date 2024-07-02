@@ -10,6 +10,8 @@ import math
 import json
 from pathlib import Path
 import time
+import os
+import shutil
 
 import accelerate
 import safetensors.torch as safetorch
@@ -33,7 +35,7 @@ def ensure_distributed():
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument('--batch-size', type=int, default=64,
+    p.add_argument('--batch-size', type=int, default=256,
                    help='the batch size')
     p.add_argument('--checkpointing', action='store_true',
                    help='enable gradient checkpointing')
@@ -44,12 +46,12 @@ def main():
                    help='compile the model')
     p.add_argument('--config', type=str, required=True,
                    help='the configuration file')
-    p.add_argument('--demo-every', type=int, default=500,
+    p.add_argument('--demo-every', type=int, default=5000,
                    help='save a demo grid every this many steps')
     p.add_argument('--dinov2-model', type=str, default='vitl14',
                    choices=K.evaluation.DINOv2FeatureExtractor.available_models(),
                    help='the DINOv2 model to use to evaluate')
-    p.add_argument('--end-step', type=int, default=None,
+    p.add_argument('--end-step', type=int, default=50000,
                    help='the step to end training at')
     p.add_argument('--evaluate-every', type=int, default=10000,
                    help='evaluate every this many steps')
@@ -72,6 +74,7 @@ def main():
                    help='the name of the run')
     p.add_argument('--num-workers', type=int, default=8,
                    help='the number of data loader workers')
+    p.add_argument('--prefix', type=str)
     p.add_argument('--reset-ema', action='store_true',
                    help='reset the EMA')
     p.add_argument('--resume', type=str,
@@ -97,6 +100,7 @@ def main():
                    help='save model to wandb')
     args = p.parse_args()
 
+    
     mp.set_start_method(args.start_method)
     torch.backends.cuda.matmul.allow_tf32 = True
     try:
@@ -110,6 +114,10 @@ def main():
     opt_config = config['optimizer']
     sched_config = config['lr_sched']
     ema_sched_config = config['ema_sched']
+
+    if not os.path.exists(f'Checkpoint{args.prefix}'):
+        os.makedirs(f'Checkpoint{args.prefix}')
+        print(f"New directory created: Checkpoint{args.prefix}")
 
     # TODO: allow non-square input sizes
     assert len(model_config['input_size']) == 2 and model_config['input_size'][0] == model_config['input_size'][1]
@@ -266,7 +274,7 @@ def main():
     model = K.config.make_denoiser_wrapper(config)(inner_model)
     model_ema = K.config.make_denoiser_wrapper(config)(inner_model_ema)
 
-    state_path = Path(f'{args.name}_state.json')
+    state_path = Path(f'Checkpoint{args.prefix}/{args.name}_state.json')
 
     if state_path.exists() or args.resume:
         if args.resume:
@@ -325,7 +333,7 @@ def main():
             print('Computing features for reals...')
         reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size)
         if accelerator.is_main_process and not args.evaluate_only:
-            metrics_log = K.utils.CSVLogger(f'{args.name}_metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
+            metrics_log = K.utils.CSVLogger(f'Checkpoint{args.prefix}/{args.name}_metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
         del train_iter
 
     cfg_scale = 1.
@@ -346,9 +354,12 @@ def main():
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
     def demo():
+        if not os.path.exists(f'Demo{args.prefix}'):
+            os.makedirs(f'Demo{args.prefix}')
+            print(f"New directory created: Demo{args.prefix}")
         if accelerator.is_main_process:
             tqdm.write('Sampling...')
-        filename = f'{args.name}_demo_{step:08}.png'
+        filename = f'Demo{args.prefix}/{args.name}_demo_{step:08}.png'
         n_per_proc = math.ceil(args.sample_n / accelerator.num_processes)
         x = torch.randn([accelerator.num_processes, n_per_proc, model_config['input_channels'], size[0], size[1]], generator=demo_gen).to(device)
         dist.broadcast(x, 0)
@@ -416,12 +427,15 @@ def main():
             'elapsed': elapsed,
         }
         accelerator.save(obj, filename)
+
         if accelerator.is_main_process:
             state_obj = {'latest_checkpoint': filename}
             json.dump(state_obj, open(state_path, 'w'))
         if args.wandb_save_model and use_wandb:
             wandb.save(filename)
-
+        src = filename
+        dest = f'Checkpoint{args.prefix}/{args.name}_{step:08}.pth'
+        shutil.move(src, dest)
     if args.evaluate_only:
         if not evaluate_enabled:
             raise ValueError('--evaluate-only requested but evaluation is disabled')
@@ -479,7 +493,7 @@ def main():
                 else:
                     elapsed += time.time() - start_timer
 
-                if step % 25 == 0:
+                if step % 100 == 0:
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']

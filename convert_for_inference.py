@@ -16,13 +16,17 @@ def main():
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("checkpoint", type=Path,
                    help="the training checkpoint to convert")
-    p.add_argument("--config", type=Path,
-                   help="override the checkpoint's configuration")
+    p.add_argument("--config", type=Path, required=True,
+                   help="override the checkpoint's configuration") 
     p.add_argument("--output", "-o", type=Path,
                    help="the output slim checkpoint")
+    p.add_argument("--prefix", type=str)
     p.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="fp16",
                    help="the output dtype")
     args = p.parse_args()
+
+    print(f'Checkpoint{args.prefix}/{args.checkpoint}')
+    args.checkpoint = Path(f'Checkpoint{args.prefix}/{args.checkpoint}')
 
     print(f"Loading training checkpoint {args.checkpoint}...", file=sys.stderr)
     ckpt = torch.load(args.checkpoint, map_location="cpu")

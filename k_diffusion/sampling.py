@@ -258,12 +258,14 @@ def linear_multistep_coeff(order, t, i, j):
 
 
 @torch.no_grad()
-def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, order=4):
+def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, order=4, start_step=0, stop_step=None):
+    if stop_step == None or stop_step >= len(sigmas):
+        stop_step = len(sigmas) - 1
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     sigmas_cpu = sigmas.detach().cpu().numpy()
     ds = []
-    for i in trange(len(sigmas) - 1, disable=disable):
+    for i in trange(start_step, stop_step, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         d = to_d(x, sigmas[i], denoised)
         ds.append(d)

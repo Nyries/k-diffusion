@@ -77,17 +77,21 @@ class DINOv2FeatureExtractor(nn.Module):
         return x
 
 
-def compute_features(accelerator, sample_fn, extractor_fn, n, batch_size):
+def compute_features(accelerator, sample_fn, extractor_fn, n, batch_size, x = None):
     n_per_proc = math.ceil(n / accelerator.num_processes)
     feats_all = []
     try:
         for i in trange(0, n_per_proc, batch_size, disable=not accelerator.is_main_process):
             cur_batch_size = min(n - i, batch_size)
-            samples = sample_fn(cur_batch_size)[:cur_batch_size]
+            if x != None:
+                samples = sample_fn(cur_batch_size, x)[:cur_batch_size]
+            else:
+                samples = sample_fn(cur_batch_size)[:cur_batch_size]
             feats_all.append(accelerator.gather(extractor_fn(samples)))
     except StopIteration:
         pass
     return torch.cat(feats_all)[:n]
+
 
 
 def polynomial_kernel(x, y):

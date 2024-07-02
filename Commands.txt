@@ -1,0 +1,10 @@
+python ./train.py --config configs/config_32x32_ffhq.json --name Train_v2 --batch-size 256 --prefix /vX
+
+
+python convert_for_inference.py Train_v1_00010000.pth --config configs/config_32x32_ffhq.json --prefix /vX
+
+
+python ./sample.py --checkpoint Train_v1_00010000.safetensors --prefix /vX
+
+
+python ./sample_cascaded1.py --checkpoint1 Train_v5_32x32_00050000.safetensors --checkpoint2 Train_v4_64x64_00380000.safetensors --prefix1 /v5_32x32 --prefix2 /v4_64x64 --output /Cascaded_64x64

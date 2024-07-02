@@ -4,6 +4,7 @@
 
 import argparse
 from pathlib import Path
+import os
 
 import accelerate
 import safetensors.torch as safetorch
@@ -30,6 +31,11 @@ def main():
                    help='the number of denoising steps')
     args = p.parse_args()
 
+    args.checkpoint = Path(f'Checkpoint{args.prefix}/{args.checkpoint}')
+
+    if not os.path.exists(f'Samples{args.prefix}'):
+        os.makedirs(f'Samples{args.prefix}')
+        print(f"New directory created: Samples{args.prefix}")
     config = K.config.load_config(args.config if args.config else args.checkpoint)
     model_config = config['model']
     # TODO: allow non-square input sizes
@@ -62,7 +68,7 @@ def main():
         x_0 = K.evaluation.compute_features(accelerator, sample_fn, lambda x: x, args.n, args.batch_size)
         if accelerator.is_main_process:
             for i, out in enumerate(x_0):
-                filename = f'{args.prefix}_{i:05}.png'
+                filename = f'Samples{args.prefix}/out_{i:05}.png'
                 K.utils.to_pil_image(out).save(filename)
 
     try:
