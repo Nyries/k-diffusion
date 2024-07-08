@@ -264,16 +264,29 @@ class ConstantLRWithWarmup(optim.lr_scheduler._LRScheduler):
         return [warmup * base_lr for base_lr in self.base_lrs]
 
 
-def stratified_uniform(shape, group=0, groups=1, dtype=None, device=None):
+def stratified_uniform(shape, group=0, groups=1, start_step=0, stop_step=None, dtype=None, device=None):
     """Draws stratified samples from a uniform distribution."""
     if groups <= 0:
         raise ValueError(f"groups must be positive, got {groups}")
     if group < 0 or group >= groups:
         raise ValueError(f"group must be in [0, {groups})")
+    
     n = shape[-1] * groups
-    offsets = torch.arange(group, n, groups, dtype=dtype, device=device)
+    if stop_step is None:
+        stop_step = n
+    # offsets = torch.arange(group, n, groups, dtype=dtype, device=device)
+    offsets = torch.linspace(start_step, stop_step, n, device=device)
+    # print(f'offset:{offsets}')
+    # print(offsets.shape)
     u = torch.rand(shape, dtype=dtype, device=device)
-    return (offsets + u) / n
+    # print(f'u: {u}')
+    vector = (offsets + u) / n
+    vector = torch.clip(vector, max=1.)
+    # print(f'vector{vector}')
+    # exit()
+    return vector   
+
+
 
 
 stratified_settings = threading.local()
@@ -310,13 +323,13 @@ def enable_stratified_accelerate(accelerator, disable=False):
         pass
 
 
-def stratified_with_settings(shape, dtype=None, device=None):
+def stratified_with_settings(shape, start_step=0, stop_step=None, dtype=None, device=None):
     """Draws stratified samples from a uniform distribution, using settings from a context
     manager."""
     if not hasattr(stratified_settings, 'disable') or stratified_settings.disable:
         return torch.rand(shape, dtype=dtype, device=device)
     return stratified_uniform(
-        shape, stratified_settings.group, stratified_settings.groups, dtype=dtype, device=device
+        shape, stratified_settings.group, stratified_settings.groups, start_step=start_step, stop_step=stop_step, dtype=dtype, device=device
     )
 
 
@@ -351,7 +364,7 @@ def rand_v_diffusion(shape, sigma_data=1., min_value=0., max_value=float('inf'),
     return torch.tan(u * math.pi / 2) * sigma_data
 
 
-def rand_cosine_interpolated(shape, image_d, noise_d_low, noise_d_high, sigma_data=1., min_value=1e-3, max_value=1e3, device='cpu', dtype=torch.float32):
+def rand_cosine_interpolated(shape, image_d, noise_d_low, noise_d_high, sigma_data=1., min_value=1e-3, max_value=1e3, start_step=0, stop_step=None, device='cpu', dtype=torch.float32):
     """Draws samples from an interpolated cosine timestep distribution (from simple diffusion)."""
 
     def logsnr_schedule_cosine(t, logsnr_min, logsnr_max):
@@ -370,7 +383,7 @@ def rand_cosine_interpolated(shape, image_d, noise_d_low, noise_d_high, sigma_da
 
     logsnr_min = -2 * math.log(min_value / sigma_data)
     logsnr_max = -2 * math.log(max_value / sigma_data)
-    u = stratified_with_settings(shape, device=device, dtype=dtype)
+    u = stratified_with_settings(shape, start_step=start_step, stop_step=stop_step, device=device, dtype=dtype)
     logsnr = logsnr_schedule_cosine_interpolated(u, image_d, noise_d_low, noise_d_high, logsnr_min, logsnr_max)
     return torch.exp(-logsnr / 2) * sigma_data
 
@@ -416,10 +429,8 @@ class CSVLogger:
         self.filename = Path(filename)
         self.columns = columns
         if self.filename.exists():
-            print('exist')
             self.file = open(self.filename, 'a')
         else:
-            print("doesn't exist")
             self.file = open(self.filename, 'w')
             self.write(*self.columns)
 

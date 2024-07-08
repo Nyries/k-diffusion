@@ -267,6 +267,9 @@ def main():
         gns_stats = K.gns.GradientNoiseScale()
     else:
         gns_stats = None
+    if "stop_step" not in model_config:
+        model_config.setdefault("stop_step", None)
+    assert model_config["start_step"] < min(model_config["input_size"]), "start_step is to big compared to resolution"
     sigma_min = model_config['sigma_min']
     sigma_max = model_config['sigma_max']
     sample_density = K.config.make_sample_density(model_config)
@@ -468,6 +471,7 @@ def main():
                         sigma = sample_density([reals.shape[0]], device=device)
                     with K.models.checkpointing(args.checkpointing):
                         losses = model.loss(reals, noise, sigma, aug_cond=aug_cond, **extra_args)
+                        
                     loss = accelerator.gather(losses).mean().item()
                     losses_since_last_print.append(loss)
                     accelerator.backward(losses.mean())
