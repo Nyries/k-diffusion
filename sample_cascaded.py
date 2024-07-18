@@ -31,6 +31,22 @@ def create_ssh_client(server, port, user, password):
 def transfer_folder(ssh, remote_path, local_path):
     with SCPClient(ssh.get_transport()) as scp:
         scp.get(remote_path, local_path, recursive=True)
+    
+def step_schedule(base, total_steps, models_number, type='Fibonacci'):
+    """Creates a list of steps at which the model start sampling
+    base must be below 1 or below total_steps"""
+    steps = []
+    assert base > 0 and base < total_steps, "base value doesn't match"
+    if base > 1.0:
+        base = base / total_steps #base > 1
+    step = base * total_steps
+    match type:
+        case 'Fibonacci':
+            for i in range(models_number):
+                steps.append(round(step))
+                step += base * (total_steps - step)
+
+    return steps
 
 def block_noise(ref_x, randn_like=torch.randn_like, block_size=1, device=None):
     """
@@ -49,16 +65,10 @@ def block_noise(ref_x, randn_like=torch.randn_like, block_size=1, device=None):
     
     return blk_noise
 
-def schedule():
-    """
-    return: list of schedule split"""
-    L = []
-    return L
-
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument('--batch-size', type=int, default=64,
+    p.add_argument('--batch-size', type=int, default=128,
                    help='the batch size')
     p.add_argument('--checkpoints', type=Path, nargs='+',
                    help='the first checkpoint to use')
@@ -85,6 +95,8 @@ def main():
     sigmas_max = []
     sizes = []
     start_steps = []
+    #steps = step_schedule(2/3, args.steps, len(args.checkpoints)-1)
+    steps = [ int(args.steps*2/3), int(args.steps*2/3), int(args.steps*2/3)]
     for i,checkpoint in enumerate(args.checkpoints):
         checkpoint = Path(f'Checkpoint/{args.prefix[i]}/{checkpoint}')
 
@@ -106,13 +118,10 @@ def main():
         accelerator.print('Parameters:', K.utils.n_params(inner_models[i]))
         models.append(K.Denoiser(inner_models[i], sigma_data=model_configs[i]['sigma_data']))
 
-
+  
         sigmas_min.append(model_configs[i]['sigma_min'])
         sigmas_max.append(model_configs[i]['sigma_max'])
-
-        start_step = int(args.steps * 9/10)
-
-    
+        
     for i in range(len(args.checkpoints)):
         K.utils.eval_mode(models[i])
         
@@ -134,16 +143,12 @@ def main():
                 K.utils.to_pil_image(out).save(filename)
         j = 1
         if len(args.checkpoints) != 1:
-            for model,model_config,sigma_min,sigma_max,size in zip(models[1:],model_configs[1:],sigmas_min[1:],sigmas_max[1:],sizes[1:]):
+            for model,model_config,sigma_min,sigma_max,size,start_step in zip(models[1:],model_configs[1:],sigmas_min[1:],sigmas_max[1:],sizes[1:],steps):
                 sigmas = K.sampling.get_sigmas_karras(args.steps, sigma_min, sigma_max, rho=7., device=device)
                 noise_ratio = sigmas[start_step] / sigma_max
-                print(sigmas[0], sigmas[-1], sigmas[start_step])
 
 
-                x_0 = F.interpolate(x_0, scale_factor=2, mode='nearest')
-
-                print(x_0.shape)
-                    
+                x_0 = F.interpolate(x_0, scale_factor=2, mode='nearest')                    
                 def sample_fn2(n, x):
                     noise = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
                     image = noise_ratio * noise + (1 - noise_ratio) * x

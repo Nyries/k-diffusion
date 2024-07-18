@@ -10,6 +10,7 @@ import torch
 from torch import nn
 import torch._dynamo
 from torch.nn import functional as F
+import numpy as np
 
 from . import flags, flops
 from .. import layers
@@ -31,6 +32,7 @@ if flags.get_use_compile():
     torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
     torch._dynamo.config.suppress_errors = True
 
+activation_array = []
 
 # Helpers
 
@@ -125,8 +127,11 @@ def scale_for_cosine_sim_qkv(qkv, scale, eps):
 
 class Linear(nn.Linear):
     def forward(self, x):
+        global activation_array
         flops.op(flops.op_linear, x.shape, self.weight.shape)
-        return super().forward(x)
+        x = super().forward(x)
+        activation_array.append(float(torch.mean(torch.abs(x))))
+        return x
 
 
 class LinearGEGLU(nn.Linear):
@@ -135,8 +140,11 @@ class LinearGEGLU(nn.Linear):
         self.out_features = out_features
 
     def forward(self, x):
+        global activation_array
         flops.op(flops.op_linear, x.shape, self.weight.shape)
-        return linear_geglu(x, self.weight, self.bias)
+        x =linear_geglu(x, self.weight, self.bias)
+        activation_array.append(float(torch.mean(torch.abs(x))))
+        return x
 
 
 class RMSNorm(nn.Module):
@@ -710,9 +718,11 @@ class ImageTransformerDenoiserModelV2(nn.Module):
         return groups
 
     def forward(self, x, sigma, aug_cond=None, class_cond=None, mapping_cond=None):
+        global activation_array
         # Patching
         x = x.movedim(-3, -1)
         x = self.patch_in(x)
+        activation_array.append(float(torch.mean(torch.abs(x))))
         # TODO: pixel aspect ratio for nonsquare patches
         pos = make_axial_pos(x.shape[-3], x.shape[-2], device=x.device).view(x.shape[-3], x.shape[-2], 2)
 
@@ -737,17 +747,23 @@ class ImageTransformerDenoiserModelV2(nn.Module):
             skips.append(x)
             poses.append(pos)
             x = merge(x)
+            activation_array.append(float(torch.mean(torch.abs(x))))
             pos = downscale_pos(pos)
 
         x = self.mid_level(x, pos, cond)
 
+
         for up_level, split, skip, pos in reversed(list(zip(self.up_levels, self.splits, skips, poses))):
             x = split(x, skip)
+            activation_array.append(float(torch.mean(torch.abs(x))))
             x = up_level(x, pos, cond)
+            
+
 
         # Unpatching
         x = self.out_norm(x)
         x = self.patch_out(x)
+        activation_array.append(float(torch.mean(torch.abs(x))))
         x = x.movedim(-1, -3)
 
         return x

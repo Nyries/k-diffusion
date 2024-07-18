@@ -12,6 +12,7 @@ from pathlib import Path
 import time
 import os
 import shutil
+import numpy as np
 
 import accelerate
 import safetensors.torch as safetorch
@@ -27,9 +28,20 @@ from tqdm.auto import tqdm
 import k_diffusion as K
 
 
+
 def ensure_distributed():
     if not dist.is_initialized():
         dist.init_process_group(world_size=1, rank=0, store=dist.HashStore())
+
+def get_weight_from_keys(dict: dict):
+    """Function used to get the weights from the state dictionary of a model."""
+    weight_array = []
+    keys = dict.keys()
+    for key in keys:
+        if 'weight' in key:
+            #print(torch.mean(torch.abs(torch.Tensor.cpu(dict[key]))))
+            weight_array.append(float(torch.mean(torch.abs(torch.Tensor.cpu(dict[key])))))
+    return weight_array
 
 
 def main():
@@ -51,7 +63,7 @@ def main():
     p.add_argument('--dinov2-model', type=str, default='vitl14',
                    choices=K.evaluation.DINOv2FeatureExtractor.available_models(),
                    help='the DINOv2 model to use to evaluate')
-    p.add_argument('--end-step', type=int, default=50000,
+    p.add_argument('--end-step', type=int, default=500000,
                    help='the step to end training at')
     p.add_argument('--evaluate-every', type=int, default=10000,
                    help='evaluate every this many steps')
@@ -107,7 +119,6 @@ def main():
         torch._dynamo.config.automatic_dynamic_shapes = False
     except AttributeError:
         pass
-
     config = K.config.load_config(args.config)
     model_config = config['model']
     dataset_config = config['dataset']
@@ -122,6 +133,9 @@ def main():
     # TODO: allow non-square input sizes
     assert len(model_config['input_size']) == 2 and model_config['input_size'][0] == model_config['input_size'][1]
     size = model_config['input_size']
+
+    weight_array = np.load(f'Checkpoint{args.prefix}/weight_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/weight_array.npy') else []
+    activation_array_train = np.load(f'Checkpoint{args.prefix}/activation_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/activation_array.npy') else []
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps, mixed_precision=args.mixed_precision)
     ensure_distributed()
@@ -269,7 +283,7 @@ def main():
         gns_stats = None
     if "stop_step" not in model_config:
         model_config.setdefault("stop_step", None)
-    assert model_config["start_step"] < min(model_config["input_size"]), "start_step is to big compared to resolution"
+    #assert model_config["start_step"] < min(model_config["input_size"]), "start_step is to big compared to resolution"
     sigma_min = model_config['sigma_min']
     sigma_max = model_config['sigma_max']
     sample_density = K.config.make_sample_density(model_config)
@@ -432,7 +446,7 @@ def main():
         accelerator.save(obj, filename)
 
         if accelerator.is_main_process:
-            state_obj = {'latest_checkpoint': filename}
+            state_obj = {'latest_checkpoint': f'Checkpoint{args.name}/{filename}'}
             json.dump(state_obj, open(state_path, 'w'))
         if args.wandb_save_model and use_wandb:
             wandb.save(filename)
@@ -450,6 +464,7 @@ def main():
     try:
         while True:
             for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
+                from k_diffusion.models.image_transformer_v2 import activation_array
                 if device.type == 'cuda':
                     start_timer = torch.cuda.Event(enable_timing=True)
                     end_timer = torch.cuda.Event(enable_timing=True)
@@ -489,7 +504,8 @@ def main():
                     if accelerator.sync_gradients:
                         K.utils.ema_update(model, model_ema, ema_decay)
                         ema_sched.step()
-
+                    weight_array.append(float(np.mean(get_weight_from_keys(model.state_dict())))) 
+                    activation_array_train.append(float(np.mean(activation_array)))                  
                 if device.type == 'cuda':
                     end_timer.record()
                     torch.cuda.synchronize()
@@ -498,6 +514,9 @@ def main():
                     elapsed += time.time() - start_timer
 
                 if step % 100 == 0:
+                    
+                    np.save(f"Checkpoint{args.prefix}/activation_array.npy", activation_array_train)
+                    np.save(f"Checkpoint{args.prefix}/weight_array.npy", weight_array)
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
@@ -505,7 +524,7 @@ def main():
                         if args.gns:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
                         else:
-                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
+                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, weight(mean): {weight_array[-1]:g}, activation(mean): {activation_array[-1]:g}')
 
                 if use_wandb:
                     log_dict = {
@@ -520,8 +539,8 @@ def main():
 
                 step += 1
 
-                if step % args.demo_every == 0:
-                    demo()
+                # if step % args.demo_every == 0:
+                #     demo()
 
                 if evaluate_enabled and step > 0 and step % args.evaluate_every == 0:
                     evaluate()
