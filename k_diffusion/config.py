@@ -146,7 +146,7 @@ def load_config(path_or_dict):
     return merge(defaults, config)
 
 
-def make_model(config):
+def make_model(config:dict):
     dataset_config = config['dataset']
     num_classes = dataset_config['num_classes']
     config = config['model']
@@ -185,6 +185,8 @@ def make_model(config):
         assert len(config['widths']) == len(config['d_ffs'])
         assert len(config['widths']) == len(config['self_attns'])
         assert len(config['widths']) == len(config['dropout_rate'])
+        if 'magnitude_preserving' in config.keys():
+            assert type(config["magnitude_preserving"]) is bool 
         levels = []
         for depth, width, d_ff, self_attn, dropout in zip(config['depths'], config['widths'], config['d_ffs'], config['self_attns'], config['dropout_rate']):
             if self_attn['type'] == 'global':
@@ -207,6 +209,7 @@ def make_model(config):
             patch_size=config['patch_size'],
             num_classes=num_classes + 1 if num_classes else 0,
             mapping_cond_dim=config['mapping_cond_dim'],
+            normalized=config.get('magnitude_preserving',True)
         )
     else:
         raise ValueError(f'unsupported model type {config["type"]}')

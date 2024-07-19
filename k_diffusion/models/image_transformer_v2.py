@@ -10,6 +10,7 @@ import torch
 from torch import nn
 import torch._dynamo
 from torch.nn import functional as F
+from torch.nn.utils.parametrizations import weight_norm
 import numpy as np
 
 from . import flags, flops
@@ -123,18 +124,44 @@ def scale_for_cosine_sim_qkv(qkv, scale, eps):
     return torch.stack((q, k, v), dim=2)
 
 
+
+
 # Layers
 
-class Linear(nn.Linear):
+class Linear_original(nn.Linear):
+    def __init__(self, in_features, out_features, bias=True, normalized=False, eps=1e-6):
+        super().__init__(in_features, out_features, bias=bias)
+        self.normalized = normalized
+        self.eps = eps
+
     def forward(self, x):
         global activation_array
         flops.op(flops.op_linear, x.shape, self.weight.shape)
+        
+        if self.normalized:
+            return 
         x = super().forward(x)
         activation_array.append(float(torch.mean(torch.abs(x))))
         return x
+    
+    def weight_normalization(self):
+        norm = torch.norm(self.weight, p=2)
+        self.weight = nn.Parameter(self.weight/(norm + self.eps), requires_grad=True)
 
-
-class LinearGEGLU(nn.Linear):
+class Linear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, normalized=True, eps=1e-6):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.normalized = normalized
+        
+    def forward(self, x):
+        weight = F.normalize(self.weight, p=2, dim=1) if self.normalized else self.weight
+        return F.linear(x, weight, self.bias)
+    
+class LinearGEGLU(Linear):
     def __init__(self, in_features, out_features, bias=True):
         super().__init__(in_features, out_features * 2, bias=bias)
         self.out_features = out_features
@@ -142,7 +169,8 @@ class LinearGEGLU(nn.Linear):
     def forward(self, x):
         global activation_array
         flops.op(flops.op_linear, x.shape, self.weight.shape)
-        x =linear_geglu(x, self.weight, self.bias)
+        weight = F.normalize(self.weight, p=2, dim=1) if self.normalized else self.weight
+        x =linear_geglu(x, weight, self.bias)
         activation_array.append(float(torch.mean(torch.abs(x))))
         return x
 
@@ -161,10 +189,10 @@ class RMSNorm(nn.Module):
 
 
 class AdaRMSNorm(nn.Module):
-    def __init__(self, features, cond_features, eps=1e-6):
+    def __init__(self, features, cond_features, normalized=True, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.linear = apply_wd(zero_init(Linear(cond_features, features, bias=False)))
+        self.linear = apply_wd(zero_init(Linear(cond_features, features, bias=False, normalized=normalized)))
         tag_module(self.linear, "mapping")
 
     def extra_repr(self):
@@ -352,16 +380,16 @@ def use_flash_2(x):
 
 
 class SelfAttentionBlock(nn.Module):
-    def __init__(self, d_model, d_head, cond_features, dropout=0.0):
+    def __init__(self, d_model, d_head, cond_features, dropout=0.0, normalized=True):
         super().__init__()
         self.d_head = d_head
         self.n_heads = d_model // d_head
-        self.norm = AdaRMSNorm(d_model, cond_features)
-        self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False))
+        self.norm = AdaRMSNorm(d_model, cond_features, normalized=normalized)
+        self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False, normalized=normalized))
         self.scale = nn.Parameter(torch.full([self.n_heads], 10.0))
         self.pos_emb = AxialRoPE(d_head // 2, self.n_heads)
         self.dropout = nn.Dropout(dropout)
-        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False)))
+        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False, normalized=normalized)))
 
     def extra_repr(self):
         return f"d_head={self.d_head},"
@@ -396,17 +424,17 @@ class SelfAttentionBlock(nn.Module):
 
 
 class NeighborhoodSelfAttentionBlock(nn.Module):
-    def __init__(self, d_model, d_head, cond_features, kernel_size, dropout=0.0):
+    def __init__(self, d_model, d_head, cond_features, kernel_size, dropout=0.0, normalized=True):
         super().__init__()
         self.d_head = d_head
         self.n_heads = d_model // d_head
         self.kernel_size = kernel_size
-        self.norm = AdaRMSNorm(d_model, cond_features)
-        self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False))
+        self.norm = AdaRMSNorm(d_model, cond_features, normalized=normalized)
+        self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False, normalized=normalized))
         self.scale = nn.Parameter(torch.full([self.n_heads], 10.0))
         self.pos_emb = AxialRoPE(d_head // 2, self.n_heads)
         self.dropout = nn.Dropout(dropout)
-        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False)))
+        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False, normalized=normalized)))
 
     def extra_repr(self):
         return f"d_head={self.d_head}, kernel_size={self.kernel_size}"
@@ -443,18 +471,18 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
 
 
 class ShiftedWindowSelfAttentionBlock(nn.Module):
-    def __init__(self, d_model, d_head, cond_features, window_size, window_shift, dropout=0.0):
+    def __init__(self, d_model, d_head, cond_features, window_size, window_shift, dropout=0.0, normalized=True):
         super().__init__()
         self.d_head = d_head
         self.n_heads = d_model // d_head
         self.window_size = window_size
         self.window_shift = window_shift
-        self.norm = AdaRMSNorm(d_model, cond_features)
-        self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False))
+        self.norm = AdaRMSNorm(d_model, cond_features, normalized=normalized)
+        self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False, normalized=normalized))
         self.scale = nn.Parameter(torch.full([self.n_heads], 10.0))
         self.pos_emb = AxialRoPE(d_head // 2, self.n_heads)
         self.dropout = nn.Dropout(dropout)
-        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False)))
+        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False, normalized=normalized)))
 
     def extra_repr(self):
         return f"d_head={self.d_head}, window_size={self.window_size}, window_shift={self.window_shift}"
@@ -476,12 +504,12 @@ class ShiftedWindowSelfAttentionBlock(nn.Module):
 
 
 class FeedForwardBlock(nn.Module):
-    def __init__(self, d_model, d_ff, cond_features, dropout=0.0):
+    def __init__(self, d_model, d_ff, cond_features, dropout=0.0, normalized=True):
         super().__init__()
-        self.norm = AdaRMSNorm(d_model, cond_features)
-        self.up_proj = apply_wd(LinearGEGLU(d_model, d_ff, bias=False))
+        self.norm = AdaRMSNorm(d_model, cond_features, normalized=normalized)
+        self.up_proj = apply_wd(LinearGEGLU(d_model, d_ff, bias=False, normalized=normalized))
         self.dropout = nn.Dropout(dropout)
-        self.down_proj = apply_wd(zero_init(Linear(d_ff, d_model, bias=False)))
+        self.down_proj = apply_wd(zero_init(Linear(d_ff, d_model, bias=False, normalized=normalized)))
 
     def forward(self, x, cond):
         skip = x
@@ -493,10 +521,10 @@ class FeedForwardBlock(nn.Module):
 
 
 class GlobalTransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, d_head, cond_features, dropout=0.0):
+    def __init__(self, d_model, d_ff, d_head, cond_features, dropout=0.0, normalized=True):
         super().__init__()
-        self.self_attn = SelfAttentionBlock(d_model, d_head, cond_features, dropout=dropout)
-        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
+        self.self_attn = SelfAttentionBlock(d_model, d_head, cond_features, dropout=dropout, normalized=normalized)
+        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout, normalized=normalized)
 
     def forward(self, x, pos, cond):
         x = checkpoint(self.self_attn, x, pos, cond)
@@ -505,10 +533,10 @@ class GlobalTransformerLayer(nn.Module):
 
 
 class NeighborhoodTransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, d_head, cond_features, kernel_size, dropout=0.0):
+    def __init__(self, d_model, d_ff, d_head, cond_features, kernel_size, dropout=0.0, normalized=True):
         super().__init__()
-        self.self_attn = NeighborhoodSelfAttentionBlock(d_model, d_head, cond_features, kernel_size, dropout=dropout)
-        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
+        self.self_attn = NeighborhoodSelfAttentionBlock(d_model, d_head, cond_features, kernel_size, dropout=dropout, normalized=normalized)
+        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout, normalized=normalized)
 
     def forward(self, x, pos, cond):
         x = checkpoint(self.self_attn, x, pos, cond)
@@ -517,11 +545,11 @@ class NeighborhoodTransformerLayer(nn.Module):
 
 
 class ShiftedWindowTransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, d_head, cond_features, window_size, index, dropout=0.0):
+    def __init__(self, d_model, d_ff, d_head, cond_features, window_size, index, dropout=0.0, normalized=True):
         super().__init__()
         window_shift = window_size // 2 if index % 2 == 1 else 0
-        self.self_attn = ShiftedWindowSelfAttentionBlock(d_model, d_head, cond_features, window_size, window_shift, dropout=dropout)
-        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
+        self.self_attn = ShiftedWindowSelfAttentionBlock(d_model, d_head, cond_features, window_size, window_shift, dropout=dropout, normalized=normalized)
+        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout, normalized=normalized)
 
     def forward(self, x, pos, cond):
         x = checkpoint(self.self_attn, x, pos, cond)
@@ -530,9 +558,9 @@ class ShiftedWindowTransformerLayer(nn.Module):
 
 
 class NoAttentionTransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, cond_features, dropout=0.0):
+    def __init__(self, d_model, d_ff, cond_features, dropout=0.0, normalized=True):
         super().__init__()
-        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
+        self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout, normalized=normalized)
 
     def forward(self, x, pos, cond):
         x = checkpoint(self.ff, x, cond)
@@ -549,12 +577,12 @@ class Level(nn.ModuleList):
 # Mapping network
 
 class MappingFeedForwardBlock(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.0):
+    def __init__(self, d_model, d_ff, dropout=0.0, normalized=True):
         super().__init__()
         self.norm = RMSNorm(d_model)
-        self.up_proj = apply_wd(LinearGEGLU(d_model, d_ff, bias=False))
+        self.up_proj = apply_wd(LinearGEGLU(d_model, d_ff, bias=False, normalized=normalized))
         self.dropout = nn.Dropout(dropout)
-        self.down_proj = apply_wd(zero_init(Linear(d_ff, d_model, bias=False)))
+        self.down_proj = apply_wd(zero_init(Linear(d_ff, d_model, bias=False, normalized=normalized)))
 
     def forward(self, x):
         skip = x
@@ -566,10 +594,10 @@ class MappingFeedForwardBlock(nn.Module):
 
 
 class MappingNetwork(nn.Module):
-    def __init__(self, n_layers, d_model, d_ff, dropout=0.0):
+    def __init__(self, n_layers, d_model, d_ff, dropout=0.0, normalized=True):
         super().__init__()
         self.in_norm = RMSNorm(d_model)
-        self.blocks = nn.ModuleList([MappingFeedForwardBlock(d_model, d_ff, dropout=dropout) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([MappingFeedForwardBlock(d_model, d_ff, dropout=dropout, normalized=normalized) for _ in range(n_layers)])
         self.out_norm = RMSNorm(d_model)
 
     def forward(self, x):
@@ -583,11 +611,11 @@ class MappingNetwork(nn.Module):
 # Token merging and splitting
 
 class TokenMerge(nn.Module):
-    def __init__(self, in_features, out_features, patch_size=(2, 2)):
+    def __init__(self, in_features, out_features, patch_size=(2, 2), normalized=True):
         super().__init__()
         self.h = patch_size[0]
         self.w = patch_size[1]
-        self.proj = apply_wd(Linear(in_features * self.h * self.w, out_features, bias=False))
+        self.proj = apply_wd(Linear(in_features * self.h * self.w, out_features, bias=False, normalized=normalized))
 
     def forward(self, x):
         x = rearrange(x, "... (h nh) (w nw) e -> ... h w (nh nw e)", nh=self.h, nw=self.w)
@@ -595,11 +623,11 @@ class TokenMerge(nn.Module):
 
 
 class TokenSplitWithoutSkip(nn.Module):
-    def __init__(self, in_features, out_features, patch_size=(2, 2)):
+    def __init__(self, in_features, out_features, patch_size=(2, 2), normalized=True):
         super().__init__()
         self.h = patch_size[0]
         self.w = patch_size[1]
-        self.proj = apply_wd(Linear(in_features, out_features * self.h * self.w, bias=False))
+        self.proj = apply_wd(Linear(in_features, out_features * self.h * self.w, bias=False, normalized=normalized))
 
     def forward(self, x):
         x = self.proj(x)
@@ -607,11 +635,11 @@ class TokenSplitWithoutSkip(nn.Module):
 
 
 class TokenSplit(nn.Module):
-    def __init__(self, in_features, out_features, patch_size=(2, 2)):
+    def __init__(self, in_features, out_features, patch_size=(2, 2), normalized=True):
         super().__init__()
         self.h = patch_size[0]
         self.w = patch_size[1]
-        self.proj = apply_wd(Linear(in_features, out_features * self.h * self.w, bias=False))
+        self.proj = apply_wd(Linear(in_features, out_features * self.h * self.w, bias=False, normalized=normalized))
         self.fac = nn.Parameter(torch.ones(1) * 0.5)
 
     def forward(self, x, skip):
@@ -664,30 +692,30 @@ class MappingSpec:
 # Model class
 
 class ImageTransformerDenoiserModelV2(nn.Module):
-    def __init__(self, levels, mapping, in_channels, out_channels, patch_size, num_classes=0, mapping_cond_dim=0):
+    def __init__(self, levels, mapping, in_channels, out_channels, patch_size, num_classes=0, mapping_cond_dim=0, normalized=True):
         super().__init__()
         self.num_classes = num_classes
 
-        self.patch_in = TokenMerge(in_channels, levels[0].width, patch_size)
+        self.patch_in = TokenMerge(in_channels, levels[0].width, patch_size, normalized=normalized)
 
         self.time_emb = layers.FourierFeatures(1, mapping.width)
-        self.time_in_proj = Linear(mapping.width, mapping.width, bias=False)
+        self.time_in_proj = Linear(mapping.width, mapping.width, bias=False, normalized=normalized)
         self.aug_emb = layers.FourierFeatures(9, mapping.width)
-        self.aug_in_proj = Linear(mapping.width, mapping.width, bias=False)
+        self.aug_in_proj = Linear(mapping.width, mapping.width, bias=False, normalized=normalized)
         self.class_emb = nn.Embedding(num_classes, mapping.width) if num_classes else None
-        self.mapping_cond_in_proj = Linear(mapping_cond_dim, mapping.width, bias=False) if mapping_cond_dim else None
-        self.mapping = tag_module(MappingNetwork(mapping.depth, mapping.width, mapping.d_ff, dropout=mapping.dropout), "mapping")
+        self.mapping_cond_in_proj = Linear(mapping_cond_dim, mapping.width, bias=False, normalized=normalized) if mapping_cond_dim else None
+        self.mapping = tag_module(MappingNetwork(mapping.depth, mapping.width, mapping.d_ff, dropout=mapping.dropout, normalized=normalized), "mapping")
 
         self.down_levels, self.up_levels = nn.ModuleList(), nn.ModuleList()
         for i, spec in enumerate(levels):
             if isinstance(spec.self_attn, GlobalAttentionSpec):
-                layer_factory = lambda _: GlobalTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, dropout=spec.dropout)
+                layer_factory = lambda _: GlobalTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, dropout=spec.dropout, normalized=normalized)
             elif isinstance(spec.self_attn, NeighborhoodAttentionSpec):
-                layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, dropout=spec.dropout)
+                layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, dropout=spec.dropout, normalized=normalized)
             elif isinstance(spec.self_attn, ShiftedWindowAttentionSpec):
-                layer_factory = lambda i: ShiftedWindowTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.window_size, i, dropout=spec.dropout)
+                layer_factory = lambda i: ShiftedWindowTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.window_size, i, dropout=spec.dropout, normalized=normalized)
             elif isinstance(spec.self_attn, NoAttentionSpec):
-                layer_factory = lambda _: NoAttentionTransformerLayer(spec.width, spec.d_ff, mapping.width, dropout=spec.dropout)
+                layer_factory = lambda _: NoAttentionTransformerLayer(spec.width, spec.d_ff, mapping.width, dropout=spec.dropout, normalized=normalized)
             else:
                 raise ValueError(f"unsupported self attention spec {spec.self_attn}")
 
@@ -697,11 +725,11 @@ class ImageTransformerDenoiserModelV2(nn.Module):
             else:
                 self.mid_level = Level([layer_factory(i) for i in range(spec.depth)])
 
-        self.merges = nn.ModuleList([TokenMerge(spec_1.width, spec_2.width) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
-        self.splits = nn.ModuleList([TokenSplit(spec_2.width, spec_1.width) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
+        self.merges = nn.ModuleList([TokenMerge(spec_1.width, spec_2.width, normalized=normalized) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
+        self.splits = nn.ModuleList([TokenSplit(spec_2.width, spec_1.width, normalized=normalized) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
 
         self.out_norm = RMSNorm(levels[0].width)
-        self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size)
+        self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size, normalized=normalized)
         nn.init.zeros_(self.patch_out.proj.weight)
 
     def param_groups(self, base_lr=5e-4, mapping_lr_scale=1 / 3):

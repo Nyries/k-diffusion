@@ -22,7 +22,8 @@
         "sigma_sample_density": {
             "type": "cosine-interpolated"
         },
-        "start_step": 64
+        "start_step": 64,
+        "magnitude_preserving": true
     },
     "dataset": {
         "type": "imagefolder",

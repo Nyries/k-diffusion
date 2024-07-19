@@ -43,6 +43,17 @@ def get_weight_from_keys(dict: dict):
             weight_array.append(float(torch.mean(torch.abs(torch.Tensor.cpu(dict[key])))))
     return weight_array
 
+def weight_normalization(dict:dict, eps=1e-6):
+    keys = dict.keys()
+    for key in keys:
+        if 'weight' in key:
+            weight = torch.Tensor.cpu(dict[key])
+            norm = torch.norm(weight, p=2)
+            normalized_weight = weight / (norm + eps)
+            dict[key] = torch.Tensor.cuda(normalized_weight)
+    return dict
+
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
@@ -136,6 +147,7 @@ def main():
 
     weight_array = np.load(f'Checkpoint{args.prefix}/weight_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/weight_array.npy') else []
     activation_array_train = np.load(f'Checkpoint{args.prefix}/activation_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/activation_array.npy') else []
+    loss_array = np.load(f'Checkpoint{args.prefix}/loss_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/loss_array.npy') else []
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps, mixed_precision=args.mixed_precision)
     ensure_distributed()
@@ -446,7 +458,7 @@ def main():
         accelerator.save(obj, filename)
 
         if accelerator.is_main_process:
-            state_obj = {'latest_checkpoint': f'Checkpoint{args.name}/{filename}'}
+            state_obj = {'latest_checkpoint': f'Checkpoint{args.prefix}/{filename}'}
             json.dump(state_obj, open(state_path, 'w'))
         if args.wandb_save_model and use_wandb:
             wandb.save(filename)
@@ -488,6 +500,7 @@ def main():
                         losses = model.loss(reals, noise, sigma, aug_cond=aug_cond, **extra_args)
                         
                     loss = accelerator.gather(losses).mean().item()
+                    loss_array.append(loss)
                     losses_since_last_print.append(loss)
                     accelerator.backward(losses.mean())
                     if args.gns:
@@ -498,7 +511,8 @@ def main():
                     opt.step()
                     sched.step()
                     opt.zero_grad()
-
+                    # dict = weight_normalization(model.state_dict)
+                    # model.set_extra_state(dict)
                     ema_decay = ema_sched.get_value()
                     K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
                     if accelerator.sync_gradients:
@@ -517,6 +531,7 @@ def main():
                     
                     np.save(f"Checkpoint{args.prefix}/activation_array.npy", activation_array_train)
                     np.save(f"Checkpoint{args.prefix}/weight_array.npy", weight_array)
+                    np.save(f"Checkpoint{args.prefix}/loss_array.npy")
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
