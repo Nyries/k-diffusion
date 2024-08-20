@@ -143,6 +143,11 @@ def load_config(path_or_dict):
             config['model']['dropout_rate'] = [0.0] * len(config['model']['widths'])
         elif isinstance(config['model']['dropout_rate'], float):
             config['model']['dropout_rate'] = [config['model']['dropout_rate']] * len(config['model']['widths'])
+        # config['model'] = merge(default_pagoda, config['model'])
+        # if "pagoda" in config['model'].keys():
+            
+    elif config['model']['type'] == 'configA':
+        pass
     return merge(defaults, config)
 
 
@@ -200,6 +205,14 @@ def make_model(config:dict):
             else:
                 raise ValueError(f'unsupported self attention type {self_attn["type"]}')
             levels.append(models.image_transformer_v2.LevelSpec(depth, width, d_ff, self_attn, dropout))
+        # if "pagoda" in config:
+        #     pagoda_config = config["pagoda"]
+        #     assert len(pagoda_config['widths']) == len(pagoda_config['depths'])
+        #     assert len(pagoda_config['widths']) == len(pagoda_config['d_ffs'])
+        #     assert len(pagoda_config['widths']) == len(pagoda_config['self_attns'])
+        #     assert len(pagoda_config['widths']) == len(pagoda_config['dropout_rate'])
+        #     pagoda=[]
+        #     for depth, width, d_ff, self_attn, dropout in zip()
         mapping = models.image_transformer_v2.MappingSpec(config['mapping_depth'], config['mapping_width'], config['mapping_d_ff'], config['mapping_dropout_rate'])
         model = models.ImageTransformerDenoiserModelV2(
             levels=levels,
@@ -209,7 +222,33 @@ def make_model(config:dict):
             patch_size=config['patch_size'],
             num_classes=num_classes + 1 if num_classes else 0,
             mapping_cond_dim=config['mapping_cond_dim'],
-            normalized=config.get('magnitude_preserving',True)
+            #normalized=config.get('magnitude_preserving',False)
+        )
+    elif config['type'] == 'configA':
+        assert len(config['resolutions']) == len(config['channels'])
+        assert config['attention_resolutions'][-1] == config['resolutions'][-1]
+        assert type(config['depths']) == int
+        model = models.ConfigADenoiser(
+            channels=config['channels'],
+            resolutions=config['resolutions'],
+            attn_res=config['attention_resolutions'],
+            depths=config['depths'],
+            prob_dropout=config['prob_dropout'],
+            num_group=config.get('num_group', 32),
+            bias=config.get('bias', True)
+        )
+    elif config['type'] == 'configB':
+        assert len(config['resolutions']) == len(config['channels'])
+        assert config['attention_resolutions'][-1] == config['resolutions'][-1]
+        assert type(config['depths']) == int
+        model = models.ConfigBDenoiser(
+            channels=config['channels'],
+            resolutions=config['resolutions'],
+            attn_res=config['attention_resolutions'],
+            depths=config['depths'],
+            prob_dropout=config['prob_dropout'],
+            num_group=config.get('num_group', 32),
+            bias=config.get('bias', True)
         )
     else:
         raise ValueError(f'unsupported model type {config["type"]}')
@@ -231,6 +270,10 @@ def make_denoiser_wrapper(config):
         if has_variance:
             raise ValueError('Simple loss config does not support a variance output')
         return partial(layers.SimpleLossDenoiser, sigma_data=sigma_data)
+    if loss_config == 'configB':
+        weighting = config.get('loss_weighting', 'karras')
+        scales = config.get('loss_scales', 1)
+        return partial(layers.ConfigBDenoiser, sigma_data=sigma_data, weighting=weighting, scales=scales)
     raise ValueError('Unknown loss config type')
 
 

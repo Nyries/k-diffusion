@@ -1,0 +1,47 @@
+{
+    "model": {
+        "type": "configB",
+        "input_channels": 3,
+        "input_size": [64, 64],
+        "depths": 4,
+        "resolutions":[64, 32, 16, 8],
+        "channels": [192,384,576,768],
+        "attention_resolutions": [16,8],
+        "loss_config": "configB",
+        "loss_weighting": "edm",
+        "loss_scale": 100,
+        "prob_dropout": 0.1,
+        "num_group":32,
+        "augment_prob": 0.12,
+        "sigma_data": 0.5,
+        "sigma_min": 1e-1,
+        "sigma_max": 80,
+        "sigma_sample_density": {
+            "type": "lognormal",
+            "mean": -0.4,
+            "std": 1.0
+        },
+        "bias": true
+    },
+
+    "dataset": {
+        "type": "imagefolder",
+        "location": "/home/luser/ffhq_dataset/ffhq64",
+        "cond_dropout_rate": 0.1
+    },
+    "optimizer": {
+        "type": "adamw",
+        "lr": 2e-4,
+        "betas": [0.9, 0.99],
+        "eps": 1e-8,
+        "weight_decay": 1e-4
+    },
+    "lr_sched": {
+        "type": "constant",
+        "warmup": 0.1
+    },
+    "ema_sched": {
+        "type": "post-hoc",
+        "sigma_rel": 0.09
+    }
+}

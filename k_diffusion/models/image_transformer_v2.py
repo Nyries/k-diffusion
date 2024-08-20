@@ -123,13 +123,38 @@ def scale_for_cosine_sim_qkv(qkv, scale, eps):
     q, k = scale_for_cosine_sim(q, k, scale[:, None], eps)
     return torch.stack((q, k, v), dim=2)
 
+def normalize(x: torch.Tensor, eps=1e-4) -> torch.Tensor:
+    dim = list(range(1, x.ndim))
+    n = torch.linalg.vector_norm(x, dim=dim, keepdim=True)
+    alpha = np.sqrt(n.numel() / x.numel())
+    return x / torch.add(eps, n, alpha=alpha)
+
+
+def weight_standardization(weight: torch.Tensor, eps: float = 1e-5):
+
+    # Get $C_{out}$, $C_{in}$ and kernel shape
+    c_out, c_in, *kernel_shape = weight.shape
+    # Reshape $W$ to $O \times I$
+    weight = weight.view(c_out, -1)
+    # Calculate
+    #
+    # \begin{align}
+    # \mu_{W_{i,\cdot}} &= \frac{1}{I} \sum_{j=1}^I W_{i,j} \\
+    # \sigma^2_{W_{i,\cdot}} &= \frac{1}{I} \sum_{j=1}^I W^2_{i,j} - \mu^2_{W_{i,\cdot}}
+    # \end{align}
+    var, mean = torch.var_mean(weight, dim=1, keepdim=True)
+    # Normalize
+    # $$\hat{W}_{i,j} = \frac{W_{i,j} - \mu_{W_{i,\cdot}}} {\sigma_{W_{i,\cdot}}}$$
+    weight = (weight - mean) / (torch.sqrt(var + eps))
+    # Change back to original shape and return
+    return weight.view(c_out, c_in, *kernel_shape)
 
 
 
 # Layers
 
-class Linear_original(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, normalized=False, eps=1e-6):
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=False, normalized=False, eps=1e-6):
         super().__init__(in_features, out_features, bias=bias)
         self.normalized = normalized
         self.eps = eps
@@ -137,42 +162,79 @@ class Linear_original(nn.Linear):
     def forward(self, x):
         global activation_array
         flops.op(flops.op_linear, x.shape, self.weight.shape)
-        
-        if self.normalized:
-            return 
         x = super().forward(x)
         activation_array.append(float(torch.mean(torch.abs(x))))
         return x
-    
-    def weight_normalization(self):
-        norm = torch.norm(self.weight, p=2)
-        self.weight = nn.Parameter(self.weight/(norm + self.eps), requires_grad=True)
 
-class Linear(nn.Module):
+class Linear2(nn.Module):
     def __init__(self, in_features, out_features, bias=True, normalized=True, eps=1e-6):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.randn(out_features, in_features))
-        self.bias = nn.Parameter(torch.zeros(out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
         self.normalized = normalized
         
     def forward(self, x):
-        weight = F.normalize(self.weight, p=2, dim=1) if self.normalized else self.weight
-        return F.linear(x, weight, self.bias)
+        if self.training and self.normalized:
+            with torch.no_grad():
+                self.weight.copy_(weight_standardization(self.weight))
+        # fan_in = self.weight[0].numel()
+        # weight = normalize(self.weight) / np.sqrt(fan_in) if self.normalized else self.weight
+        #weight = F.normalize(self.weight, p=2, dim=1) if self.normalized else self.weight
+        x = F.linear(x, self.weight, self.bias)
+        activation_array.append(float(torch.mean(torch.abs(x))))
+        return x
     
 class LinearGEGLU(Linear):
-    def __init__(self, in_features, out_features, bias=True):
-        super().__init__(in_features, out_features * 2, bias=bias)
+    def __init__(self, in_features, out_features, bias=True, normalized=True):
+        super().__init__(in_features, out_features * 2, bias=bias, normalized=normalized)
         self.out_features = out_features
 
     def forward(self, x):
         global activation_array
         flops.op(flops.op_linear, x.shape, self.weight.shape)
-        weight = F.normalize(self.weight, p=2, dim=1) if self.normalized else self.weight
-        x =linear_geglu(x, weight, self.bias)
+        # if self.training and self.normalized:
+        #     with torch.no_grad():
+        #         self.weight.copy_(normalize(self.weight))
+        # fan_in = self.weight[0].numel()
+        # weight = normalize(self.weight) / np.sqrt(fan_in) if self.normalized else self.weight
+        # weight = F.normalize(self.weight, p=2, dim=1) if self.normalized else self.weight
+        x =linear_geglu(x, self.weight, self.bias)
         activation_array.append(float(torch.mean(torch.abs(x))))
         return x
+
+class InstanceNorm(nn.Module):
+    def __init__(self, channels: int, eps: float=1e-5, affine: bool=True, normalized=None):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.affine = affine
+
+        if self.affine:
+            self.scale = nn.Parameter(torch.ones(channels))
+            self.shift = nn.Parameter(torch.zeros(channels))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        x_shape = x.shape
+        batch_size = x_shape[0]
+        assert self.channels == x_shape[1]
+        x = x.view(batch_size, self.channels, -1)
+        mean = x.mean(dim=[-1], keepdim=True)
+        mean_sq = (x**2).mean(dim=[-1], keepdim=True)
+        var = mean_sq - mean ** 2
+
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+        x_norm = x_norm.view(batch_size, self.channels, -1)
+
+        if self.affine:
+            x_norm = self.scale.view(1, -1, 1) * x_norm + self.shift.view(1, -1, 1)
+        
+        return x_norm.view(x_shape)
 
 
 class RMSNorm(nn.Module):
@@ -187,6 +249,8 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return rms_norm(x, self.scale, self.eps)
 
+class PixelWIseNorm(nn.Module):
+    pass
 
 class AdaRMSNorm(nn.Module):
     def __init__(self, features, cond_features, normalized=True, eps=1e-6):
@@ -692,7 +756,7 @@ class MappingSpec:
 # Model class
 
 class ImageTransformerDenoiserModelV2(nn.Module):
-    def __init__(self, levels, mapping, in_channels, out_channels, patch_size, num_classes=0, mapping_cond_dim=0, normalized=True):
+    def __init__(self, levels, mapping, in_channels, out_channels, patch_size, pagoda=None, num_classes=0, mapping_cond_dim=0, normalized=True):
         super().__init__()
         self.num_classes = num_classes
 
@@ -724,6 +788,21 @@ class ImageTransformerDenoiserModelV2(nn.Module):
                 self.up_levels.append(Level([layer_factory(i + spec.depth) for i in range(spec.depth)]))
             else:
                 self.mid_level = Level([layer_factory(i) for i in range(spec.depth)])
+
+        # if pagoda is not None:
+        #     for i, spec in enumerate(pagoda):
+        #         if isinstance(spec.self_attn, GlobalAttentionSpec):
+        #             layer_factory = lambda _: GlobalTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, dropout=spec.dropout, normalized=normalized)
+        #         elif isinstance(spec.self_attn, NeighborhoodAttentionSpec):
+        #             layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, dropout=spec.dropout, normalized=normalized)
+        #         elif isinstance(spec.self_attn, ShiftedWindowAttentionSpec):
+        #             layer_factory = lambda i: ShiftedWindowTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.window_size, i, dropout=spec.dropout, normalized=normalized)
+        #         elif isinstance(spec.self_attn, NoAttentionSpec):
+        #             layer_factory = lambda _: NoAttentionTransformerLayer(spec.width, spec.d_ff, mapping.width, dropout=spec.dropout, normalized=normalized)
+        #         else:
+        #             raise ValueError(f"unsupported self attention spec {spec.self_attn}")
+        #         if i < len(levels) - 1:
+        #             self.up_levels.append(Level([layer_factory(i + spec.depth) for i in range(spec.depth)]))
 
         self.merges = nn.ModuleList([TokenMerge(spec_1.width, spec_2.width, normalized=normalized) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
         self.splits = nn.ModuleList([TokenSplit(spec_2.width, spec_1.width, normalized=normalized) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
@@ -767,8 +846,7 @@ class ImageTransformerDenoiserModelV2(nn.Module):
         class_emb = self.class_emb(class_cond) if self.class_emb is not None else 0
         mapping_emb = self.mapping_cond_in_proj(mapping_cond) if self.mapping_cond_in_proj is not None else 0
         cond = self.mapping(time_emb + aug_emb + class_emb + mapping_emb)
-
-        # Hourglass transformer
+            # Hourglass transformer
         skips, poses = [], []
         for down_level, merge in zip(self.down_levels, self.merges):
             x = down_level(x, pos, cond)

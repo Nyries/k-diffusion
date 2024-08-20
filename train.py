@@ -69,7 +69,7 @@ def main():
                    help='compile the model')
     p.add_argument('--config', type=str, required=True,
                    help='the configuration file')
-    p.add_argument('--demo-every', type=int, default=5000,
+    p.add_argument('--demo-every', type=int, default=1000,
                    help='save a demo grid every this many steps')
     p.add_argument('--dinov2-model', type=str, default='vitl14',
                    choices=K.evaluation.DINOv2FeatureExtractor.available_models(),
@@ -218,14 +218,18 @@ def main():
                                       num_steps=sched_config['num_steps'],
                                       decay=sched_config['decay'],
                                       warmup=sched_config['warmup'])
+    elif sched_config['type'] == 'kingma':
+        sched = K.utils.KingmaLR(opt, time_ref=sched_config['time_ref'])
     elif sched_config['type'] == 'constant':
         sched = K.utils.ConstantLRWithWarmup(opt, warmup=sched_config['warmup'])
     else:
         raise ValueError('Invalid schedule type')
 
-    assert ema_sched_config['type'] == 'inverse'
-    ema_sched = K.utils.EMAWarmup(power=ema_sched_config['power'],
-                                  max_value=ema_sched_config['max_value'])
+    if ema_sched_config['type'] == 'inverse':
+        ema_sched = K.utils.EMAWarmup(power=ema_sched_config['power'],
+                                    max_value=ema_sched_config['max_value'])
+    elif ema_sched_config['type'] == 'post-hoc':
+        ema_sched = K.utils.PostHocEMA(sigma_rel=ema_sched_config['sigma_rel'])
     ema_stats = {}
 
     tf = transforms.Compose([
@@ -273,7 +277,7 @@ def main():
                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
 
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
-
+    pass
     with torch.no_grad(), K.models.flops.flop_counter() as fc:
         x = torch.zeros([1, model_config['input_channels'], size[0], size[1]], device=device)
         sigma = torch.ones([1], device=device)
@@ -476,7 +480,8 @@ def main():
     try:
         while True:
             for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
-                from k_diffusion.models.image_transformer_v2 import activation_array
+                # from k_diffusion.models.image_transformer_v2 import activation_array
+                from k_diffusion.models.configA import activation_array
                 if device.type == 'cuda':
                     start_timer = torch.cuda.Event(enable_timing=True)
                     end_timer = torch.cuda.Event(enable_timing=True)
@@ -513,7 +518,7 @@ def main():
                     opt.zero_grad()
                     # dict = weight_normalization(model.state_dict)
                     # model.set_extra_state(dict)
-                    ema_decay = ema_sched.get_value()
+                    ema_decay = ema_sched.get_value() if ema_sched_config['type'] == 'inverse' else ema_sched.get_value(step)
                     K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
                     if accelerator.sync_gradients:
                         K.utils.ema_update(model, model_ema, ema_decay)
@@ -531,7 +536,7 @@ def main():
                     
                     np.save(f"Checkpoint{args.prefix}/activation_array.npy", activation_array_train)
                     np.save(f"Checkpoint{args.prefix}/weight_array.npy", weight_array)
-                    np.save(f"Checkpoint{args.prefix}/loss_array.npy")
+                    np.save(f"Checkpoint{args.prefix}/loss_array.npy", loss_array)
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
@@ -539,7 +544,7 @@ def main():
                         if args.gns:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
                         else:
-                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, weight(mean): {weight_array[-1]:g}, activation(mean): {activation_array[-1]:g}')
+                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, weight(mean): {weight_array[-1]:g} activation(mean): {activation_array[-1]:g}')
 
                 if use_wandb:
                     log_dict = {
@@ -554,8 +559,8 @@ def main():
 
                 step += 1
 
-                # if step % args.demo_every == 0:
-                #     demo()
+                if step % args.demo_every == 0:
+                    demo()
 
                 if evaluate_enabled and step > 0 and step % args.evaluate_every == 0:
                     evaluate()

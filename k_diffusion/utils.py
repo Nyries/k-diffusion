@@ -1,12 +1,14 @@
 from contextlib import contextmanager
 import hashlib
 import math
+import numpy as  np
 from pathlib import Path
 import shutil
 import threading
 import time
 import urllib
 import warnings
+
 
 from PIL import Image
 import safetensors
@@ -22,6 +24,11 @@ def from_pil_image(x):
     if x.ndim == 2:
         x = x[..., None]
     return x * 2 - 1
+
+def sigma_rel_to_gamma ( sigma_rel ):
+    t = sigma_rel ** -2
+    gamma = np.roots([1, 7, 16 - t, 12 - t]).real.max()
+    return gamma
 
 
 def to_pil_image(x):
@@ -151,6 +158,19 @@ class EMAWarmup:
         """Updates the step count."""
         self.last_epoch += 1
 
+class PostHocEMA(EMAWarmup):
+    def __init__(self, inv_gamma=1, power=1, min_value=0, max_value=1, start_at=0, last_epoch=0, gamma=6.94, sigma_rel=0.1,  eps=1e-4):
+        super().__init__(inv_gamma, power, min_value, max_value, start_at, last_epoch)
+        self.sigma_rel = sigma_rel
+        self.gamma = sigma_rel_to_gamma(self.sigma_rel)
+        self.eps = eps
+
+    def get_value(self, step):
+        """Gets the current EMA decay rate using post-hoc EMA computation from T.Karras (2024)"""
+        epoch = max(0, self.last_epoch - self.start_at)
+        value = (1 - 1 / (step + self.eps)) ** (self.gamma + 1)
+        return 0. if epoch < 0 else min(self.max_value, max(self.min_value, value))
+
 
 class InverseLR(optim.lr_scheduler._LRScheduler):
     """Implements an inverse decay learning rate schedule with an optional exponential
@@ -232,6 +252,44 @@ class ExponentialLR(optim.lr_scheduler._LRScheduler):
         lr_mult = (self.decay ** (1 / self.num_steps)) ** self.last_epoch
         return [warmup * max(self.min_lr, base_lr * lr_mult)
                 for base_lr in self.base_lrs]
+    
+class KingmaLR(optim.lr_scheduler._LRScheduler):
+    """Implements a learning rate schedule from Karras paper Analysing and Improving the Training Dynamics of Diffusion Models with an optional exponential
+    warmup. When last_epoch=-1, sets initial lr as lr. Decays the learning rate
+    continuously by decay (default 0.5) every num_steps steps.
+    Args:
+        optimizer (Optimizer): Wrapped optimizer.
+        num_steps (float): The number of steps to decay the learning rate by decay in.
+        decay (float): The factor by which to decay the learning rate every num_steps
+            steps. Default: 0.5.
+        warmup (float): Exponential warmup factor (0 <= warmup < 1, 0 to disable)
+            Default: 0.
+        min_lr (float): The minimum learning rate. Default: 0.
+        last_epoch (int): The index of last epoch. Default: -1.
+        verbose (bool): If ``True``, prints a message to stdout for
+            each update. Default: ``False``.
+    """
+
+    def __init__(self, optimizer, time_ref, warmup=0., min_lr=0.,
+                 last_epoch=-1, verbose=False):
+        self.time_ref = time_ref
+        if not 0. <= warmup < 1:
+            raise ValueError('Invalid value for warmup')
+        self.warmup = warmup
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch, verbose)
+
+    def get_lr(self):
+        if not self._get_lr_called_within_step:
+            warnings.warn("To get the last learning rate computed by the scheduler, "
+                          "please use `get_last_lr()`.")
+
+        return self._get_closed_form_lr()
+
+    def _get_closed_form_lr(self):
+        warmup = 1 - self.warmup ** (self.last_epoch + 1)
+        return [warmup * base_lr/ max(math.sqrt(self._step_count/self.time_ref),1)
+                for base_lr in self.base_lrs]
 
 
 class ConstantLRWithWarmup(optim.lr_scheduler._LRScheduler):
@@ -271,19 +329,23 @@ def stratified_uniform(shape, group=0, groups=1, start_step=0, stop_step=None, d
     if group < 0 or group >= groups:
         raise ValueError(f"group must be in [0, {groups})")
     
-    n = shape[-1] * groups
-    if stop_step is None:
-        stop_step = n
+    # n = shape[-1] * groups
+    # if stop_step is None:
+    #     stop_step = n
     # offsets = torch.arange(group, n, groups, dtype=dtype, device=device)
-    offsets = torch.linspace(start_step, stop_step, n, device=device)
-    # print(f'offset:{offsets}')
-    # print(offsets.shape)
-    u = torch.rand(shape, dtype=dtype, device=device)
-    # print(f'u: {u}')
-    vector = (offsets + u) / n
-    vector = torch.clip(vector, max=1.)
+    # # offsets = torch.linspace(start_step, stop_step, n, device=device)
+    # # print(f'offset:{offsets}')  
+    # # print(offsets.shape)
+    # u = torch.rand(shape, dtype=dtype, device=device)
+    # # print(f'u: {u}')
+    # vector = (offsets + u) / n
+    # vector = torch.clip(vector, max=1.)
     # print(f'vector{vector}')
     # exit()
+    n = shape[-1] * groups
+    offsets = torch.arange(group, n, groups, dtype=dtype, device=device)
+    u = torch.rand(shape, dtype=dtype, device=device)
+    return (offsets + u) / n
     return vector   
 
 

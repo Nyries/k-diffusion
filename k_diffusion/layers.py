@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from . import sampling, utils
+from . import sampling, utils, models
 
 
 # Helper functions
@@ -58,6 +58,8 @@ class Denoiser(nn.Module):
             self.weighting = self._weighting_soft_min_snr
         elif weighting == 'snr':
             self.weighting = self._weighting_snr
+        elif weighting == 'edm':
+            self.weighting = self._edm_weighting
         else:
             raise ValueError(f'Unknown weighting type {weighting}')
 
@@ -66,6 +68,9 @@ class Denoiser(nn.Module):
 
     def _weighting_snr(self, sigma):
         return self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+    
+    def _edm_weighting(self, sigma):
+        return (sigma * self.sigma_data) ** 2 / (sigma ** 2 + self.sigma_data ** 2) 
 
     def get_scalings(self, sigma):
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
@@ -89,6 +94,23 @@ class Denoiser(nn.Module):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
         return self.inner_model(input * c_in, sigma, **kwargs) * c_out + input * c_skip
 
+class ConfigBDenoiser(Denoiser):
+    def __init__(self, inner_model, sigma_data=1, weighting='karras', scales=1):
+        super().__init__(inner_model, sigma_data, weighting, scales)
+        self.uncertainty_fn = MLPUncertaintyFunction(intermediate_channels=64)
+    
+    def loss(self, input, noise, sigma, **kwargs):
+        c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
+        c_weight = self.weighting(sigma)
+        noised_input = input + noise * utils.append_dims(sigma, input.ndim)
+        model_output = self.inner_model(noised_input * c_in, sigma, **kwargs)
+        target = (input - c_skip * noised_input) / c_out
+        uncertainty = self.uncertainty_fn(sigma)
+        if self.scales == 1:
+            return ((model_output - target) ** 2).flatten(1).mean(1) * c_weight / uncertainty.exp() + uncertainty
+        sq_error = dct(model_output - target) ** 2
+        f_weight = freq_weight_nd(sq_error.shape[2:], self.scales, dtype=sq_error.dtype, device=sq_error.device)
+        return (sq_error * f_weight).flatten(1).mean(1) * c_weight / uncertainty.exp() + uncertainty
 
 class DenoiserWithVariance(Denoiser):
     def loss(self, input, noise, sigma, **kwargs):
@@ -109,6 +131,18 @@ class SimpleLossDenoiser(Denoiser):
         denoised = self(noised_input, sigma, **kwargs)
         eps = sampling.to_d(noised_input, sigma, denoised)
         return (eps - noise).pow(2).flatten(1).mean(1)
+
+# Uncertainty function used for the loss
+
+class MLPUncertaintyFunction(nn.Module):
+    def __init__(self, intermediate_channels) -> None:
+        super().__init__()
+        self.fourier = models.configB.FourierFeatures(1, intermediate_channels)
+        self.mlp = models.configB.Linear(in_features=intermediate_channels, out_features=1)
+    
+    def forward(self, sigma):
+        c_noise = torch.log(sigma) / 4
+        return self.mlp(self.fourier(c_noise))
 
 
 # Residual blocks
