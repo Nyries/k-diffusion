@@ -1,13 +1,13 @@
 {
     "model": {
-        "type": "configB",
+        "type": "configC",
         "input_channels": 3,
         "input_size": [64, 64],
         "depths": 4,
         "resolutions":[64, 32, 16, 8],
         "channels": [192,384,576,768],
         "attention_resolutions": [16,8],
-        "loss_config": "configB",
+        "loss_config": "karras",
         "loss_weighting": "edm",
         "loss_scale": 100,
         "prob_dropout": 0.1,
@@ -22,7 +22,7 @@
             "mean": -0.4,
             "std": 1.0
         },
-        "bias": true
+        "bias": false
     },
 
     "dataset": {

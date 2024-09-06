@@ -69,14 +69,14 @@ def main():
                    help='compile the model')
     p.add_argument('--config', type=str, required=True,
                    help='the configuration file')
-    p.add_argument('--demo-every', type=int, default=1000,
+    p.add_argument('--demo-every', type=int, default=5000,
                    help='save a demo grid every this many steps')
     p.add_argument('--dinov2-model', type=str, default='vitl14',
                    choices=K.evaluation.DINOv2FeatureExtractor.available_models(),
                    help='the DINOv2 model to use to evaluate')
     p.add_argument('--end-step', type=int, default=500000,
                    help='the step to end training at')
-    p.add_argument('--evaluate-every', type=int, default=10000,
+    p.add_argument('--evaluate-every', type=int, default=5000,
                    help='evaluate every this many steps')
     p.add_argument('--evaluate-n', type=int, default=2000,
                    help='the number of samples to draw to evaluate')
@@ -130,6 +130,8 @@ def main():
         torch._dynamo.config.automatic_dynamic_shapes = False
     except AttributeError:
         pass
+
+    # Unwrap config file 
     config = K.config.load_config(args.config)
     model_config = config['model']
     dataset_config = config['dataset']
@@ -144,10 +146,6 @@ def main():
     # TODO: allow non-square input sizes
     assert len(model_config['input_size']) == 2 and model_config['input_size'][0] == model_config['input_size'][1]
     size = model_config['input_size']
-
-    weight_array = np.load(f'Checkpoint{args.prefix}/weight_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/weight_array.npy') else []
-    activation_array_train = np.load(f'Checkpoint{args.prefix}/activation_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/activation_array.npy') else []
-    loss_array = np.load(f'Checkpoint{args.prefix}/loss_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/loss_array.npy') else []
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps, mixed_precision=args.mixed_precision)
     ensure_distributed()
@@ -165,6 +163,7 @@ def main():
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
     elapsed = 0.0
 
+    # Initializing the architecture and copy for the EMA model
     inner_model = K.config.make_model(config)
     inner_model_ema = deepcopy(inner_model)
 
@@ -184,6 +183,7 @@ def main():
         log_config['parameters'] = K.utils.n_params(inner_model)
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group, config=log_config, save_code=True)
 
+    # Initializing the Optimizer
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
     if opt_config['type'] == 'adamw':
@@ -208,6 +208,7 @@ def main():
     else:
         raise ValueError('Invalid optimizer type')
 
+    # Initializing the leraning rate schedule
     if sched_config['type'] == 'inverse':
         sched = K.utils.InverseLR(opt,
                                   inv_gamma=sched_config['inv_gamma'],
@@ -219,12 +220,14 @@ def main():
                                       decay=sched_config['decay'],
                                       warmup=sched_config['warmup'])
     elif sched_config['type'] == 'kingma':
-        sched = K.utils.KingmaLR(opt, time_ref=sched_config['time_ref'])
+        sched = K.utils.KingmaLR(opt, time_ref=sched_config['time_ref'],
+                                 warmup=sched_config['warmup'])
     elif sched_config['type'] == 'constant':
         sched = K.utils.ConstantLRWithWarmup(opt, warmup=sched_config['warmup'])
     else:
         raise ValueError('Invalid schedule type')
 
+    # Inititalizing the EMA schedule type
     if ema_sched_config['type'] == 'inverse':
         ema_sched = K.utils.EMAWarmup(power=ema_sched_config['power'],
                                     max_value=ema_sched_config['max_value'])
@@ -238,6 +241,7 @@ def main():
         K.augmentation.KarrasAugmentationPipeline(model_config['augment_prob'], disable_all=model_config['augment_prob'] == 0),
     ])
 
+    # Initializing the dataset
     if dataset_config['type'] == 'imagefolder':
         train_set = K.utils.FolderOfImages(dataset_config['location'], transform=tf)
     elif dataset_config['type'] == 'imagefolder-class':
@@ -304,11 +308,13 @@ def main():
     sigma_max = model_config['sigma_max']
     sample_density = K.config.make_sample_density(model_config)
 
+    # Initializing the denoiser
     model = K.config.make_denoiser_wrapper(config)(inner_model)
     model_ema = K.config.make_denoiser_wrapper(config)(inner_model_ema)
 
     state_path = Path(f'Checkpoint{args.prefix}/{args.name}_state.json')
 
+    # Looking if there is already an existing checkpoint for this training
     if state_path.exists() or args.resume:
         if args.resume:
             ckpt_path = args.resume
@@ -350,6 +356,15 @@ def main():
         unwrap(model_ema.inner_model).load_state_dict(ckpt)
         del ckpt
 
+    # Loading numpy for the plotting of weights, activations and loss
+    weight_array = np.load(f'Checkpoint{args.prefix}/weight_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/weight_array.npy') else []
+    activation_array_train = np.load(f'Checkpoint{args.prefix}/activation_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/activation_array.npy') else []
+    loss_array = np.load(f'Checkpoint{args.prefix}/loss_array.npy').tolist() if os.path.exists(f'Checkpoint{args.prefix}/loss_array.npy') else []
+
+    weight_array = weight_array[step:] if weight_array is not [] else weight_array
+    activation_array_train = activation_array_train[step:] if activation_array_train is not [] else activation_array_train
+    loss_array = loss_array[step:] if loss_array is not [] else loss_array
+
     evaluate_enabled = args.evaluate_every > 0 and args.evaluate_n > 0
     metrics_log = None
     if evaluate_enabled:
@@ -387,6 +402,7 @@ def main():
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
     def demo():
+        """Sampling a grid with the current checkpoint"""
         if not os.path.exists(f'Demo{args.prefix}'):
             os.makedirs(f'Demo{args.prefix}')
             print(f"New directory created: Demo{args.prefix}")
@@ -415,6 +431,7 @@ def main():
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
     def evaluate():
+        """Evaluating the model"""
         if not evaluate_enabled:
             return
         if accelerator.is_main_process:
@@ -439,6 +456,7 @@ def main():
                 wandb.log({'FID': fid.item(), 'KID': kid.item()}, step=step)
 
     def save():
+        """Saving the checkpoint"""
         accelerator.wait_for_everyone()
         filename = f'{args.name}_{step:08}.pth'
         if accelerator.is_main_process:
@@ -481,7 +499,7 @@ def main():
         while True:
             for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
                 # from k_diffusion.models.image_transformer_v2 import activation_array
-                from k_diffusion.models.configA import activation_array
+                from k_diffusion.models.configG import activation_array
                 if device.type == 'cuda':
                     start_timer = torch.cuda.Event(enable_timing=True)
                     end_timer = torch.cuda.Event(enable_timing=True)
@@ -523,6 +541,7 @@ def main():
                     if accelerator.sync_gradients:
                         K.utils.ema_update(model, model_ema, ema_decay)
                         ema_sched.step()
+                    
                     weight_array.append(float(np.mean(get_weight_from_keys(model.state_dict())))) 
                     activation_array_train.append(float(np.mean(activation_array)))                  
                 if device.type == 'cuda':
@@ -534,6 +553,7 @@ def main():
 
                 if step % 100 == 0:
                     
+                    # Saving arrays of weights, activations and loss into a .npy file
                     np.save(f"Checkpoint{args.prefix}/activation_array.npy", activation_array_train)
                     np.save(f"Checkpoint{args.prefix}/weight_array.npy", weight_array)
                     np.save(f"Checkpoint{args.prefix}/loss_array.npy", loss_array)
@@ -558,6 +578,8 @@ def main():
                     wandb.log(log_dict, step=step)
 
                 step += 1
+                if step % 1000 ==0 and step < 10000:
+                    demo()
 
                 if step % args.demo_every == 0:
                     demo()

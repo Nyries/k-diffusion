@@ -2,9 +2,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
-activation_array = []
+"""Recreating ADM architecture like https://github.com/openai/guided-diffusion and using schematic from Karras et al. paper: Analyzing and Improving the Training Dynamics of Diffusion Models.
+
+Low layer moduels like Linear and Conv2d have been recreated because Karras paper is doing improvements directly inside these layers.
+As it is stated in the name this is the baseline for further improvements. """
+
+activation_array = [] # Array used to record activation magnitudes and imported into the training file
 
 def zero_module(module):
     """
@@ -13,6 +17,8 @@ def zero_module(module):
     for p in module.parameters():
         p.detach().zero_()
     return module
+
+# Basic Layers
 
 class Conv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
@@ -96,6 +102,28 @@ class Dropout(nn.Module):
         else:
             return x
         
+    
+class UpSample(nn.Module):
+    def __init__(self, scale_factor, mode='nearest'):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.mode = mode
+    
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+    
+
+class DownSample(nn.Module):
+    def __init__(self, scale_factor, mode='nearest'):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.mode = mode
+    
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, scale_factor=1.0/self.scale_factor, mode=self.mode)
+
+# Norm Layer
+
 class GroupNorm(nn.Module):
     def __init__(self, num_groups, num_channels, eps=1e-5, affine=True):
         super().__init__()
@@ -135,23 +163,7 @@ class GroupNorm(nn.Module):
 
         return x
     
-class UpSample(nn.Module):
-    def __init__(self, scale_factor, mode='nearest'):
-        super().__init__()
-        self.scale_factor = scale_factor
-        self.mode = mode
-    
-    def forward(self, x:torch.Tensor) -> torch.Tensor:
-        return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
-    
-class DownSample(nn.Module):
-    def __init__(self, scale_factor, mode='nearest'):
-        super().__init__()
-        self.scale_factor = scale_factor
-        self.mode = mode
-    
-    def forward(self, x:torch.Tensor) -> torch.Tensor:
-        return F.interpolate(x, scale_factor=1.0/self.scale_factor, mode=self.mode)
+# Attention block
 
 class SelfAttention(nn.Module):
     def __init__(self, in_channels, num_heads=64, bias=True):
@@ -189,29 +201,7 @@ class SelfAttention(nn.Module):
         out = self.out_conv(out)
         return out + skip
 
-    
-# class Timestep_embedding(nn.Module):
-#     """
-#     Create sinusoidal timestep embeddings.
-
-#     :param timesteps: a 1-D Tensor of N indices, one per batch element.
-#                       These may be fractional.
-#     :param dim: the dimension of the output.
-#     :param max_period: controls the minimum frequency of the embeddings.
-#     :return: an [N x dim] Tensor of positional embeddings.
-#     """
-#     def __init__(self, timesteps, dim, max_period=10000):
-#         super().__init__()
-#     def forward(self, input)
-#         half = dim // 2
-#         freqs = torch.exp(
-#             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-#         ).to(device=timesteps.device)
-#         args = timesteps[:, None].float() * freqs[None]
-#         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-#         if dim % 2:
-#             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-#         return embedding
+# Embedding Layers
 
 class PositionalEmbedding(torch.nn.Module):
     def __init__(self, num_channels, max_positions=10000, endpoint=False):
@@ -228,6 +218,7 @@ class PositionalEmbedding(torch.nn.Module):
         x = torch.cat([x.cos(), x.sin()], dim=1)
         return x
     
+
 class Embedding(nn.Module):
     def __init__(self, noise_dim, hidden_dim=768, bias=True):
         super().__init__()
@@ -242,7 +233,9 @@ class Embedding(nn.Module):
         x = self.silu(self.linear1(noise_embedding))
         x = self.silu(self.linear2(x))
         return x
-    
+
+# Blocks part of the Unet
+ 
 class Input(nn.Module):
     def __init__(self, in_channels, out_channels, bias=True):
         super().__init__()
@@ -257,6 +250,7 @@ class Input(nn.Module):
     def __repr__(self):
         return f"Input with in_channels: {self.in_channels}, out_channels: {self.out_channels}"
     
+
 class Output(nn.Module):
     def __init__(self, in_channels, out_channels, num_group=32, bias=True) -> None:
         super().__init__()
@@ -276,6 +270,7 @@ class Output(nn.Module):
     def __repr__(self):
         return f"Output with in_channels: {self.in_channels}, out_channels: {self.out_channels}"
     
+
 class Encoder(nn.Module):
     def __init__(self, in_channels, out_channels, hidden_dim=768, prob_dropout=0.5, num_groups=32, attention=True, downsample=True, bias=True) -> None:
         super().__init__()
@@ -299,18 +294,17 @@ class Encoder(nn.Module):
         self.linear_emb = Linear(in_features=hidden_dim, out_features=out_channels*2, bias=bias)
 
         self.group_norm1 = GroupNorm(num_groups=num_groups, num_channels=in_channels)
-        self.silu1 = SiLU()
+        self.silu = SiLU()
         if downsample:
             self.down1 = DownSample(scale_factor=2)
         self.conv1 = Conv2d(in_channels=in_channels,out_channels=out_channels, kernel_size=3, padding=1, bias=bias)
         self.group_norm2 = GroupNorm(num_groups=num_groups, num_channels=out_channels)
-        self.silu2 = SiLU()
         self.dropout = Dropout(p=prob_dropout)
         self.conv3 = zero_module(Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1, bias=bias))
     
     def forward(self, x:torch.Tensor, emb) -> torch.Tensor:
         h = self.group_norm1(x)
-        h = self.silu1(h)
+        h = self.silu(h)
         if self.downsample:
             h = self.down1(h)
             x = self.down2(x)
@@ -322,7 +316,7 @@ class Encoder(nn.Module):
             emb = emb[..., None]
         scale, shift = torch.chunk(emb, 2, dim=1)
         h = h * (1 + scale) + shift
-        h = self.silu2(h)
+        h = self.silu(h)
         h = self.dropout(h)
         h = self.conv3(h)
         x = h + x   
@@ -357,12 +351,11 @@ class Decoder(nn.Module):
         self.linear_emb = Linear(in_features=hidden_dim, out_features=out_channels*2, bias=bias)
 
         self.group_norm1 = GroupNorm(num_groups=num_groups, num_channels=in_channels+self.skip_channels)
-        self.silu1 = SiLU()
+        self.silu = SiLU()
         if upsample:
             self.down1 = UpSample(scale_factor=2)
         self.conv1 = Conv2d(in_channels=in_channels+self.skip_channels,out_channels=out_channels,kernel_size=3, padding=1 ,bias=bias)
         self.group_norm2 = GroupNorm(num_groups=num_groups, num_channels=out_channels)
-        self.silu2 = SiLU()
         self.dropout = Dropout(p=prob_dropout)
         self.conv3 = zero_module(Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1 , bias=bias))
     
@@ -370,7 +363,7 @@ class Decoder(nn.Module):
         if skip is not None:
             x = torch.cat([x, skip], dim=1)
         h = self.group_norm1(x)
-        h = self.silu1(h)
+        h = self.silu(h)
         if self.upsample:
             h = self.down1(h)
             x = self.down2(x)
@@ -382,7 +375,7 @@ class Decoder(nn.Module):
             emb = emb[..., None]
         scale, shift = torch.chunk(emb, 2, dim=1)
         h = h * (1 + scale) + shift
-        h = self.silu2(h)
+        h = self.silu(h)
         h = self.dropout(h)
         h = self.conv3(h)
         x = h + x
@@ -393,6 +386,7 @@ class Decoder(nn.Module):
     def __repr__(self):
         return f"Decoder with in_channels: {self.in_channels}, out_channels: {self.out_channels}, skip_channels: {self.skip_channels}, upsample: {self.upsample}, attention: {self.attention}"
 
+# Unet 
 
 class ConfigADenoiser(nn.Module):
     def __init__(self, channels:tuple, resolutions:tuple, attn_res:tuple, depths: int, prob_dropout, num_group=32, bias=True):

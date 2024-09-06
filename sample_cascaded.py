@@ -74,13 +74,13 @@ def main():
                    help='the first checkpoint to use')
     p.add_argument('--config', type=Path,
                    help='the model config')
-    p.add_argument('--n', type=int, default=64,
+    p.add_argument('--n', type=int, default=32,
                    help='the number of images to sample')
     p.add_argument('--prefix', type=str, nargs='+',
                    help='the first output prefix')
     p.add_argument('--output', type=str, default='out',
                    help='the output folder')
-    p.add_argument('--steps', type=int, default=50,
+    p.add_argument('--steps', type=int, default=200,
                    help='the number of denoising steps')
     args = p.parse_args()
     
@@ -94,9 +94,8 @@ def main():
     sigmas_min = []
     sigmas_max = []
     sizes = []
-    start_steps = []
     #steps = step_schedule(2/3, args.steps, len(args.checkpoints)-1)
-    steps = [ int(args.steps*2/3), int(args.steps*2/3), int(args.steps*2/3)]
+    steps = [ int(args.steps*1/3), int(args.steps*2/3), int(args.steps*2/3)]
     for i,checkpoint in enumerate(args.checkpoints):
         checkpoint = Path(f'Checkpoint/{args.prefix[i]}/{checkpoint}')
 
@@ -110,7 +109,7 @@ def main():
         accelerator = accelerate.Accelerator()
         device = accelerator.device
         print('Using device:', device, flush=True)
-
+        print(checkpoint)
         inner_models.append(K.config.make_model(configs[i]).eval().requires_grad_(False).to(device))
         inner_models[i].load_state_dict(safetorch.load_file(checkpoint))
 
@@ -148,7 +147,7 @@ def main():
                 noise_ratio = sigmas[start_step] / sigma_max
 
 
-                x_0 = F.interpolate(x_0, scale_factor=2, mode='nearest')                    
+                x_0 = F.interpolate(x_0, scale_factor=2, mode='nearest')                                       
                 def sample_fn2(n, x):
                     noise = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
                     image = noise_ratio * noise + (1 - noise_ratio) * x

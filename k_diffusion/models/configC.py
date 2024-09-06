@@ -3,26 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-"""File containing the architecture of configuration B of Karra et al. paper: Analyzing and Improving the Training Dynamics of Diffusion Models.
-This configuration's is called minor improvements.
-It reduce the number of layers using attention and changes the computing of the loss (see layers.py).
-
-Nb: after training we noticed the results we produced weren't as good as with pre-implemented loss from K-diffusion framework. We then changed it back to the one used in K-diffusion framework."""
+"""File containing the architecture of configuration C of Karra et al. paper: Analyzing and Improving the Training Dynamics of Diffusion Models.
+This configuration's is called architectural streamlining.
+It removes the biases from active layers such as Linear, Conv2d or GroupNorm. Implementation of PixelNorm introducing cosine attention. Removing of zero-initialized modules."""
 
 activation_array = [] # Array used to record activation magnitudes and imported into the training file
-
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
 
 # Base Layers
 
 class Conv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=False):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -55,7 +45,7 @@ class Conv2d(nn.Module):
 
 
 class Linear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -98,12 +88,12 @@ class Dropout(nn.Module):
     
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         if self.training:
-            mask = (torch.rand(x.shape, device='cuda') > self.p).float()
+            mask = (torch.rand(x.shape, device=x.device) > self.p).float()
             return x * mask / (1 - self.p)
         else:
             return x
-        
     
+
 class UpSample(nn.Module):
     def __init__(self, scale_factor, mode='nearest'):
         super().__init__()
@@ -122,11 +112,25 @@ class DownSample(nn.Module):
     
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         return F.interpolate(x, scale_factor=1.0/self.scale_factor, mode=self.mode)
+
+# Norm Layers
+
+class PixelNorm(nn.Module):
+    def __init__(self, num_channels, eps=1e-4):
+        super().__init__()
+        self.num_channels =num_channels
+        self.eps = eps
     
-# Norm Layer 
+    def forward(self, x: torch.Tensor):
+        N, C, H, W = x.shape
+
+        x = torch.sqrt(torch.tensor(C)) * x / (torch.norm(x, 2, dim=1, keepdim=True) + self.eps)
+
+        return x
+    
 
 class GroupNorm(nn.Module):
-    def __init__(self, num_groups, num_channels, eps=1e-5, affine=True):
+    def __init__(self, num_groups, num_channels, eps=1e-4, affine=False):
         super().__init__()
         self.num_groups = num_groups
         self.num_channels = num_channels
@@ -151,23 +155,27 @@ class GroupNorm(nn.Module):
         N, C, H, W = x.shape
         G = self.num_groups
         assert C % G == 0, "num_channels must be divisible by num_groups"
+        channels_per_group = C // G
 
-        x = x.view(N, G, -1)
-        mean = x.mean(dim=-1, keepdim=True)
-        var= x.var(dim=-1, keepdim=True)
+        # Reshape to apply group normalization
+        x = x.view(N, G, channels_per_group, H, W)
+        
+        # Calculate the sum of squares over the channel, height, and width dimensions
+        sum_squares = torch.sum(x ** 2, dim=[2, 3, 4], keepdim=True)
+        normalization_factor = torch.sqrt(sum_squares / (channels_per_group * H * W)) + self.eps
 
-        x = (x - mean) / torch.sqrt(var + self.eps)
+        # Normalize the activations
+        x = x / normalization_factor
+        
+        # Reshape back to the original form
         x = x.view(N, C, H, W)
-
-        if self.affine:
-            x = x * self.weight + self.bias
 
         return x
     
-# Attention block
+# Attention Layer
 
 class SelfAttention(nn.Module):
-    def __init__(self, in_channels, num_heads=64, bias=True):
+    def __init__(self, in_channels, num_heads=64, bias=False):
         super().__init__()
         self.in_channels = in_channels
         self.num_heads = num_heads
@@ -175,15 +183,15 @@ class SelfAttention(nn.Module):
 
         assert in_channels % num_heads == 0, "in_channels must be divisible by num_heads"
 
-        self.group_norm = GroupNorm(num_groups=32, num_channels=in_channels)
+        self.pixel_norm = PixelNorm(num_channels=in_channels)
         self.qkv_conv = Conv2d(in_channels, in_channels * 3, kernel_size=1, bias=bias)
-        self.out_conv = zero_module(Conv2d(in_channels, in_channels, kernel_size=1, bias=bias))
+        self.out_conv = Conv2d(in_channels, in_channels, kernel_size=1, bias=bias)
 
     def forward(self, x:torch.Tensor) -> torch.Tensor :
         batch_size, channels, height, width = x.shape
         skip = x
         # GroupNorm
-        x = self.group_norm(x)
+        x = self.pixel_norm(x)
 
         # Convolution
         qkv = self.qkv_conv(x) # (batch_size, 3 * in_channels, height, width)
@@ -203,34 +211,35 @@ class SelfAttention(nn.Module):
         return out + skip
 
 # Embedding Layers
-    
-class PositionalEmbedding(torch.nn.Module):
-    def __init__(self, num_channels, max_positions=10000, endpoint=False):
+        
+class FourierFeatures(nn.Module):
+    def __init__(self, out_channels, bias=True) -> None:
         super().__init__()
-        self.num_channels = num_channels
-        self.max_positions = max_positions
-        self.endpoint = endpoint
+        self.out_channels = out_channels
 
-    def forward(self, x):
-        freqs = torch.arange(start=0, end=self.num_channels//2, dtype=torch.float32, device=x.device)
-        freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
-        freqs = (1 / self.max_positions) ** freqs
-        x = x.ger(freqs.to(x.dtype))
-        x = torch.cat([x.cos(), x.sin()], dim=1)
-        return x
-    
+        self.bias = bias
+        self.frequency = torch.randn([1,out_channels], device='cuda')
+        if self.bias:
+            self.phi = torch.rand([1, out_channels], device='cuda')
+
+    def forward(self, x: torch.Tensor):
+        """x shape must be [batch_size]"""
+        x = x[..., None]
+        nu = 2 * math.pi * (x @ self.frequency  + self.phi) if self.bias else 2 * math.pi * self.frequency * x
+        return torch.cos(nu)
+
 
 class Embedding(nn.Module):
-    def __init__(self, noise_dim, hidden_dim=768, bias=True):
+    def __init__(self, noise_dim, hidden_dim=768, bias=False):
         super().__init__()
 
-        self.pos_emb = PositionalEmbedding(noise_dim)
+        self.fourier_emb = FourierFeatures(out_channels=noise_dim)
         self.linear1 = Linear(noise_dim, hidden_dim, bias=bias)
         self.linear2 = Linear(hidden_dim, hidden_dim, bias=bias)
         self.silu= SiLU()
     
     def forward(self, noise_level):
-        noise_embedding = self.pos_emb(noise_level)
+        noise_embedding = self.fourier_emb(noise_level)
         x = self.silu(self.linear1(noise_embedding))
         x = self.silu(self.linear2(x))
         return x
@@ -238,29 +247,32 @@ class Embedding(nn.Module):
 # Block part of the Unet
 
 class Input(nn.Module):
-    def __init__(self, in_channels, out_channels, bias=True):
+    def __init__(self, in_channels, out_channels, bias=False):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.conv = Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=bias)
+        self.conv = Conv2d(in_channels+1, out_channels, kernel_size=3, padding=1, bias=bias)
 
     def forward(self, x: torch.Tensor): 
+        batch_size, _, height, width = x.shape
+        constant_channel = torch.ones(batch_size, 1, height, width).to(x.device)
+        x = torch.cat([x, constant_channel], dim=1)
         return self.conv(x)
     
     def __repr__(self):
         return f"Input with in_channels: {self.in_channels}, out_channels: {self.out_channels}"
-    
+
 
 class Output(nn.Module):
-    def __init__(self, in_channels, out_channels, num_group=32, bias=True) -> None:
+    def __init__(self, in_channels, out_channels, num_group=32, bias=False) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
 
         self.group_norm = GroupNorm(num_group, in_channels)
         self.silu = SiLU()
-        self.conv = zero_module(Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=bias))
+        self.conv = (Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=bias))
     
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         x = self.group_norm(x)
@@ -273,7 +285,7 @@ class Output(nn.Module):
     
 
 class Encoder(nn.Module):
-    def __init__(self, in_channels, out_channels, hidden_dim=768, prob_dropout=0.5, num_groups=32, attention=True, downsample=True, bias=True) -> None:
+    def __init__(self, in_channels, out_channels, hidden_dim=768, prob_dropout=0.5, num_groups=32, attention=True, downsample=True, bias=False) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -292,7 +304,7 @@ class Encoder(nn.Module):
             self.attn = SelfAttention(out_channels, bias=bias)
         
         #Embedding
-        self.linear_emb = Linear(in_features=hidden_dim, out_features=out_channels*2, bias=bias)
+        self.linear_emb = Linear(in_features=hidden_dim, out_features=out_channels, bias=bias)
 
         self.group_norm1 = GroupNorm(num_groups=num_groups, num_channels=in_channels)
         self.silu1 = SiLU()
@@ -302,7 +314,7 @@ class Encoder(nn.Module):
         self.group_norm2 = GroupNorm(num_groups=num_groups, num_channels=out_channels)
         self.silu2 = SiLU()
         self.dropout = Dropout(p=prob_dropout)
-        self.conv3 = zero_module(Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1, bias=bias))
+        self.conv3 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1, bias=bias)
     
     def forward(self, x:torch.Tensor, emb) -> torch.Tensor:
         h = self.group_norm1(x)
@@ -316,8 +328,7 @@ class Encoder(nn.Module):
         emb = self.linear_emb(emb)
         while len(emb.shape) < len(h.shape):
             emb = emb[..., None]
-        scale, shift = torch.chunk(emb, 2, dim=1)
-        h = h * (1 + scale) + shift
+        h = h * (1 + emb)
         h = self.silu2(h)
         h = self.dropout(h)
         h = self.conv3(h)
@@ -331,7 +342,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, in_channels:int, skip_channels:int, out_channels, hidden_dim=768, prob_dropout=0.5, num_groups=32, attention=True, upsample=True, bias=True) -> None:
+    def __init__(self, in_channels:int, skip_channels:int, out_channels, hidden_dim=768, prob_dropout=0.5, num_groups=32, attention=True, upsample=True, bias=False) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.skip_channels = 0 if skip_channels is None else skip_channels
@@ -350,7 +361,7 @@ class Decoder(nn.Module):
             self.attn = SelfAttention(out_channels, bias=bias)
         
         #Embedding
-        self.linear_emb = Linear(in_features=hidden_dim, out_features=out_channels*2, bias=bias)
+        self.linear_emb = Linear(in_features=hidden_dim, out_features=out_channels, bias=bias)
 
         self.group_norm1 = GroupNorm(num_groups=num_groups, num_channels=in_channels+self.skip_channels)
         self.silu1 = SiLU()
@@ -360,7 +371,7 @@ class Decoder(nn.Module):
         self.group_norm2 = GroupNorm(num_groups=num_groups, num_channels=out_channels)
         self.silu2 = SiLU()
         self.dropout = Dropout(p=prob_dropout)
-        self.conv3 = zero_module(Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1 , bias=bias))
+        self.conv3 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1 , bias=bias)
     
     def forward(self, x:torch.Tensor, emb, skip=None) -> torch.Tensor:
         if skip is not None:
@@ -376,8 +387,7 @@ class Decoder(nn.Module):
         emb = self.linear_emb(emb)
         while len(emb.shape) < len(h.shape):
             emb = emb[..., None]
-        scale, shift = torch.chunk(emb, 2, dim=1)
-        h = h * (1 + scale) + shift
+        h = h * (1 + emb)
         h = self.silu2(h)
         h = self.dropout(h)
         h = self.conv3(h)
@@ -389,10 +399,10 @@ class Decoder(nn.Module):
     def __repr__(self):
         return f"Decoder with in_channels: {self.in_channels}, out_channels: {self.out_channels}, skip_channels: {self.skip_channels}, upsample: {self.upsample}, attention: {self.attention}"
 
-# Unet 
+# Unet
 
-class ConfigBDenoiser(nn.Module):
-    def __init__(self, channels:tuple, resolutions:tuple, attn_res:tuple, depths: int, prob_dropout, num_group=32, bias=True):
+class ConfigCDenoiser(nn.Module):
+    def __init__(self, channels:tuple, resolutions:tuple, attn_res:tuple, depths: int, prob_dropout:float, num_group=32, bias=False):
         super().__init__()
         assert len(channels) == len(resolutions), "Tuple size don't match"
         self.attn_res = attn_res
@@ -402,7 +412,7 @@ class ConfigBDenoiser(nn.Module):
         self.skip_channels = []
         self.skips = []
         # Embedding
-        self.embedding = Embedding(noise_dim=192, hidden_dim=768, bias=True)
+        self.embedding = Embedding(noise_dim=192, hidden_dim=768, bias=False)
         # Input / Output
         self.input = Input(3, channels[0], bias=bias)
         self.skip_channels.append(channels[0])
@@ -475,7 +485,7 @@ class ConfigBDenoiser(nn.Module):
         ]
         return groups
     
-    def forward(self, x:torch.Tensor, sigma, aug_cond=None, class_cond=None, mapping_cond=None) -> torch.Tensor:
+    def forward(self, x:torch.Tensor, sigma, **kwargs) -> torch.Tensor:
         global activation_array
         c_noise = torch.log(sigma) / 4
         emb = self.embedding(c_noise)
@@ -492,4 +502,3 @@ class ConfigBDenoiser(nn.Module):
         x = self.output(x)   
         return x
     
-# model = ConfigADenoiser([192,384,576,768],[64, 32, 16, 8],[32,16,8],4, prob_dropout=0.5)

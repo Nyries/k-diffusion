@@ -33,7 +33,7 @@ if flags.get_use_compile():
     torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
     torch._dynamo.config.suppress_errors = True
 
-activation_array = []
+activation_array = [] # Array used to record activation magnitudes and imported into the training file
 
 # Helpers
 

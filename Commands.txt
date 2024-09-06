@@ -1,14 +1,21 @@
-python ./train.py --config configs/config_256x256_ffhq.json --name Train_v1_256x256 --batch-size 32 --prefix /v1_256x256 --resume Checkpoint/v1_256x256/Train_v1_256x256_00090000.pth
+Example of commands to use with this repository
 
-python ./train.py --config configs/config_32x32_ffhq.json --name Weight_test --batch-size 128 --prefix /Weight_test
+python ./train.py --config configs/config_256x256_ffhq.json --name Train_v2_256x256 --batch-size 32 --prefix /v2_256x256
 
-python convert_for_inference.py Train_v1_256x256_00180000.pth --config configs/config_256x256_ffhq.json --prefix /v1_256x256
+python ./train.py --config configs/configB_64x64_ffhq.json --name Train_configB_v2_64x64 --batch-size 64 --prefix /configB_v2_64x64
+python ./train.py --config configs/configC_64x64_ffhq.json --name Train_configC_v1_64x64 --batch-size 64 --prefix /configC_v1_64x64
+python ./train.py --config configs/configD_64x64_ffhq.json --name Train_configD_v1_64x64 --batch-size 64 --prefix /configD_v1_64x64
+python ./train.py --config configs/configE_64x64_ffhq.json --name Train_configE_v1_64x64 --batch-size 64 --prefix /configE_v1_64x64
+python ./train.py --config configs/configF_64x64_ffhq.json --name Train_configF_v1_64x64 --batch-size 128 --prefix /configF_v1_64x64
+python ./train.py --config configs/configG_64x64_ffhq.json --name Train_configG_v1_64x64 --batch-size 128 --prefix /configG_v1_64x64
 
-python ./sample.py --checkpoint Train_v1_00010000.safetensors --prefix /vX
+python convert_for_inference.py ConfigE_32x32_00130000.pth --config configs/configE_32x32_ffhq.json --prefix /ConfigE_32x32
+
+python ./sample.py --checkpoint Magnitude_unpreserving32x32_00010000.safetensors --prefix /Magnitude_unpreserving32x32
 
 
-python ./sample_cascaded1.py --checkpoint1 Train_v5_32x32_00050000.safetensors --checkpoint2 Train_v6_64x64_00110000.safetensors --prefix1 /v5_32x32 --prefix2 /v6_64x64 --output /Cascaded2_64x64
+python ./sample_cascaded.py --checkpoints ConfigE_32x32_00130000.safetensors Train_v6_64x64_00110000.safetensors Train_v5_128x128_00170000.safetensors --prefix ConfigE_32x32 v6_64x64 v5_128x128 --output Cascaded6_128x128
 
-python ./sample_cascaded.py --checkpoints Train_v5_32x32_00050000.safetensors Train_v6_64x64_00110000.safetensors Train_v4_128x128_00260000.safetensors --prefix v5_32x32 v6_64x64 v4_128x128 --output Cascaded4_128x128
+python ./sample_cascaded.py --checkpoints Magnitude_preserving32x32_00020000.safetensors Train_v5_128x128_00170000.safetensors --prefix Magnitude_preserving32x32 v5_128x128 --output Cascaded5_128x128
 
 python ./sample_cascaded.py --checkpoints Train_v5_32x32_00050000.safetensors Train_v6_64x64_00110000.safetensors Train_v4_128x128_00260000.safetensors Train_v1_256x256_00180000.safetensors --prefix v5_32x32 v6_64x64 v4_128x128 v1_256x256 --output Cascaded_256x256

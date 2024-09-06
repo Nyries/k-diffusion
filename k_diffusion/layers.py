@@ -7,8 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from . import sampling, utils, models
-
+from . import sampling, utils
 
 # Helper functions
 
@@ -95,9 +94,9 @@ class Denoiser(nn.Module):
         return self.inner_model(input * c_in, sigma, **kwargs) * c_out + input * c_skip
 
 class ConfigBDenoiser(Denoiser):
-    def __init__(self, inner_model, sigma_data=1, weighting='karras', scales=1):
+    def __init__(self, inner_model, in_channels, sigma_data=1, weighting='karras', scales=1):
         super().__init__(inner_model, sigma_data, weighting, scales)
-        self.uncertainty_fn = MLPUncertaintyFunction(intermediate_channels=64)
+        self.uncertainty_fn = MLPUncertaintyFunction(in_channels=in_channels, intermediate_channels=64)
     
     def loss(self, input, noise, sigma, **kwargs):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
@@ -135,14 +134,14 @@ class SimpleLossDenoiser(Denoiser):
 # Uncertainty function used for the loss
 
 class MLPUncertaintyFunction(nn.Module):
-    def __init__(self, intermediate_channels) -> None:
+    def __init__(self, in_channels, intermediate_channels) -> None:
         super().__init__()
-        self.fourier = models.configB.FourierFeatures(1, intermediate_channels)
-        self.mlp = models.configB.Linear(in_features=intermediate_channels, out_features=1)
+        self.fourier = FourierFeatures(in_channels=in_channels, out_channels=intermediate_channels)
+        self.mlp = nn.Linear(in_features=intermediate_channels, out_features=1, device='cuda', bias=False)
     
     def forward(self, sigma):
         c_noise = torch.log(sigma) / 4
-        return self.mlp(self.fourier(c_noise))
+        return self.mlp(self.fourier(c_noise.to(device='cuda')))
 
 
 # Residual blocks
@@ -156,7 +155,7 @@ class ResidualBlock(nn.Module):
     def forward(self, input):
         return self.main(input) + self.skip(input)
 
-
+    
 # Noise level (and other) conditioning
 
 class ConditionedModule(nn.Module):
@@ -316,7 +315,7 @@ class Upsample2d(nn.Module):
 
 # Embeddings
 
-class FourierFeatures(nn.Module):
+class KFourierFeatures(nn.Module):
     def __init__(self, in_features, out_features, std=1.):
         super().__init__()
         assert out_features % 2 == 0
@@ -325,6 +324,23 @@ class FourierFeatures(nn.Module):
     def forward(self, input):
         f = 2 * math.pi * input @ self.weight.T
         return torch.cat([f.cos(), f.sin()], dim=-1)
+
+class FourierFeatures(nn.Module):
+    def __init__(self, in_channels, out_channels, bias=True) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.bias = bias
+        self.frequency = torch.randn([in_channels, out_channels], device='cuda')
+        if self.bias:
+            self.phi = torch.rand([in_channels, out_channels], device='cuda')
+
+    def forward(self, x):
+        C = x.shape[0]
+        assert C == self.in_channels
+        nu = 2 * math.pi * (self.frequency * x + self.phi) if self.phi is not None else 2 * math.pi * self.frequency * x
+        return torch.cos(nu)
 
 
 # U-Nets

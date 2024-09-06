@@ -228,7 +228,7 @@ def make_model(config:dict):
         assert len(config['resolutions']) == len(config['channels'])
         assert config['attention_resolutions'][-1] == config['resolutions'][-1]
         assert type(config['depths']) == int
-        model = models.ConfigADenoiser(
+        model = models.configA.ConfigADenoiser(
             channels=config['channels'],
             resolutions=config['resolutions'],
             attn_res=config['attention_resolutions'],
@@ -241,7 +241,7 @@ def make_model(config:dict):
         assert len(config['resolutions']) == len(config['channels'])
         assert config['attention_resolutions'][-1] == config['resolutions'][-1]
         assert type(config['depths']) == int
-        model = models.ConfigBDenoiser(
+        model = models.configB.ConfigBDenoiser(
             channels=config['channels'],
             resolutions=config['resolutions'],
             attn_res=config['attention_resolutions'],
@@ -249,6 +249,71 @@ def make_model(config:dict):
             prob_dropout=config['prob_dropout'],
             num_group=config.get('num_group', 32),
             bias=config.get('bias', True)
+        )
+    elif config['type'] == 'configC':
+        assert len(config['resolutions']) == len(config['channels'])
+        assert config['attention_resolutions'][-1] == config['resolutions'][-1]
+        assert type(config['depths']) == int
+        model = models.configC.ConfigCDenoiser(
+            channels=config['channels'],
+            resolutions=config['resolutions'],
+            attn_res=config['attention_resolutions'],
+            depths=config['depths'],
+            prob_dropout=config['prob_dropout'],
+            num_group=config.get('num_group', 32),
+            bias=config.get('bias', False)
+        )
+    elif config['type'] == 'configD':
+        assert len(config['resolutions']) == len(config['channels'])
+        assert config['attention_resolutions'][-1] == config['resolutions'][-1]
+        assert type(config['depths']) == int
+        model = models.configD.ConfigDDenoiser(
+            channels=config['channels'],
+            resolutions=config['resolutions'],
+            attn_res=config['attention_resolutions'],
+            depths=config['depths'],
+            prob_dropout=config['prob_dropout'],
+            num_group=config.get('num_group', 32),
+            bias=config.get('bias', False)
+        )
+    elif config['type'] == 'configE':
+        assert len(config['resolutions']) == len(config['channels'])
+        assert config['attention_resolutions'][-1] == config['resolutions'][-1]
+        assert type(config['depths']) == int
+        model = models.configE.ConfigEDenoiser(
+            channels=config['channels'],
+            resolutions=config['resolutions'],
+            attn_res=config['attention_resolutions'],
+            depths=config['depths'],
+            prob_dropout=config['prob_dropout'],
+            num_group=config.get('num_group', 32),
+            bias=config.get('bias', False)
+        )
+    elif config['type'] == 'configF':
+        assert len(config['resolutions']) == len(config['channels'])
+        assert config['attention_resolutions'][-1] == config['resolutions'][-1]
+        assert type(config['depths']) == int
+        model = models.configF.ConfigFDenoiser(
+            channels=config['channels'],
+            resolutions=config['resolutions'],
+            attn_res=config['attention_resolutions'],
+            depths=config['depths'],
+            prob_dropout=config['prob_dropout'],
+            num_group=config.get('num_group', 32),
+            bias=config.get('bias', False)
+        )
+    elif config['type'] == 'configG':
+        assert len(config['resolutions']) == len(config['channels'])
+        assert config['attention_resolutions'][-1] == config['resolutions'][-1]
+        assert type(config['depths']) == int
+        model = models.configG.ConfigGDenoiser(
+            channels=config['channels'],
+            resolutions=config['resolutions'],
+            attn_res=config['attention_resolutions'],
+            depths=config['depths'],
+            prob_dropout=config['prob_dropout'],
+            num_group=config.get('num_group', 32),
+            bias=config.get('bias', False)
         )
     else:
         raise ValueError(f'unsupported model type {config["type"]}')
@@ -273,7 +338,8 @@ def make_denoiser_wrapper(config):
     if loss_config == 'configB':
         weighting = config.get('loss_weighting', 'karras')
         scales = config.get('loss_scales', 1)
-        return partial(layers.ConfigBDenoiser, sigma_data=sigma_data, weighting=weighting, scales=scales)
+        batch_size = config.get('batch_size', 64)
+        return partial(layers.ConfigBDenoiser, in_channels=batch_size, sigma_data=sigma_data, weighting=weighting, scales=scales)
     raise ValueError('Unknown loss config type')
 
 
