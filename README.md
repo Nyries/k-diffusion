@@ -4,7 +4,7 @@ Fork from k-diffusion model [](https://github.com/Nyries/k-diffusion/tree/master
 
 ## Usage
 
-The main files to use from user perspective are `train.py`, `convert_for_inference.py` and `sample.py`. The commands to use these files are recorded in `Commands.txt`. 
+The main files to use from user perspective are `train.py`, `convert_for_inference.py` and `sample.py`. The command lines to use these files are recorded in `Commands.txt`. 
 I recommend to create folders **Demo**, **Checkpoint** and **Samples** as I customed the training and sampling files to save their results in folder named like that.
 
 ## Location of models
